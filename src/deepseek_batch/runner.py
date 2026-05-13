@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 class AccountRunner(QObject):
     status_changed = Signal(int, str)
+    stats_updated = Signal(int)
 
     def __init__(self, account: AccountPane, window: "MainWindow") -> None:
         super().__init__(window)
@@ -28,6 +29,33 @@ class AccountRunner(QObject):
         self.last_content = ""
         self.last_change_monotonic = 0.0
         self.poll_started_monotonic = 0.0
+        self.task_start_monotonic = 0.0
+        self.assigned_count = 0
+        self.success_count = 0
+        self.failure_count = 0
+        self.total_success_seconds = 0.0
+
+    @property
+    def avg_success_seconds(self) -> float:
+        if self.success_count == 0:
+            return 0.0
+        return self.total_success_seconds / self.success_count
+
+    def _record_assigned(self) -> None:
+        self.assigned_count += 1
+        self.stats_updated.emit(self.account.account_id)
+
+    def _record_success(self) -> None:
+        if self.task_start_monotonic > 0:
+            self.total_success_seconds += time.monotonic() - self.task_start_monotonic
+        self.success_count += 1
+        self.task_start_monotonic = 0.0
+        self.stats_updated.emit(self.account.account_id)
+
+    def _record_failure(self) -> None:
+        self.failure_count += 1
+        self.task_start_monotonic = 0.0
+        self.stats_updated.emit(self.account.account_id)
 
     def start_after(self, delay_ms: int) -> None:
         self.running = True
@@ -53,6 +81,8 @@ class AccountRunner(QObject):
         self.last_content = ""
         self.last_change_monotonic = time.monotonic()
         self.poll_started_monotonic = 0.0
+        self.task_start_monotonic = time.monotonic()
+        self._record_assigned()
         self.window.mark_task(task.task_id, "准备发送", self.account.account_id)
         self.status_changed.emit(self.account.account_id, f"任务 {task.task_id}")
 
@@ -129,6 +159,7 @@ class AccountRunner(QObject):
 
         error = result.get("error") or result.get("warning") or "对话模式切换失败"
         self.running = False
+        self._record_failure()
         self.window.requeue_task(task)
         self.window.mark_task(task.task_id, f"已重排：{error}", self.account.account_id)
         self.window.log(f"账号 {self.account.account_id} 未发送任务 {task.task_id}，已重排：{error}")
@@ -149,6 +180,7 @@ class AccountRunner(QObject):
         task = self.current_task
         if not result.get("ok"):
             self.running = False
+            self._record_failure()
             self.window.requeue_task(task)
             self.window.mark_task(task.task_id, f"已重排：{result.get('error')}", self.account.account_id)
             self.window.log(f"账号 {self.account.account_id} 未发送任务 {task.task_id}，已重排：{result.get('error')}")
@@ -179,6 +211,7 @@ class AccountRunner(QObject):
         timeout = self.window.reply_timeout_spin.value()
         if now - self.poll_started_monotonic > timeout:
             self.running = False
+            self._record_failure()
             self.window.mark_task(task.task_id, "超时，账号暂停", self.account.account_id)
             self.window.log(f"账号 {self.account.account_id} 等待任务 {task.task_id} 回复超时")
             self.status_changed.emit(self.account.account_id, "已暂停")
@@ -240,6 +273,7 @@ class AccountRunner(QObject):
 
         self.window.mark_task(task.task_id, "完成", self.account.account_id)
         self.window.reset_hook_retry(task.task_id)
+        self._record_success()
         self._continue_after_task()
 
     def _after_check_hook(
@@ -255,6 +289,7 @@ class AccountRunner(QObject):
             self.window.mark_task(task.task_id, "完成（校验通过）", self.account.account_id)
             self.window.log(f"账号 {self.account.account_id} 任务 {task.task_id} 校验通过")
             self.window.reset_hook_retry(task.task_id)
+            self._record_success()
             self._continue_after_task()
             return
 
@@ -274,6 +309,7 @@ class AccountRunner(QObject):
         self._handle_check_failure(task, output_path, f"检查脚本异常：{error}")
 
     def _handle_check_failure(self, task: PromptTask, output_path: Path, reason: str) -> None:
+        self._record_failure()
         attempts = self.window.bump_hook_retry(task.task_id)
         max_retries = self.window.check_hook_max_retries()
         if attempts <= max_retries:
@@ -317,6 +353,7 @@ class AccountRunner(QObject):
 
     def _after_result_write_failed(self, task_id: str, error: str) -> None:
         self.running = False
+        self._record_failure()
         if self.current_task is not None and self.current_task.task_id == task_id:
             self.window.requeue_task(self.current_task)
             status = f"写入失败已重排：{error}"

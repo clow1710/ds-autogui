@@ -7,13 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Deque
 
-from PySide6.QtCore import QSettings, QThread, QTimer
+from PySide6.QtCore import Qt, QSettings, QThread, QTimer
 from PySide6.QtGui import QFontDatabase, QFontMetrics
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -91,11 +91,27 @@ class MainWindow(QMainWindow):
         self.runtime_dir_edit = QLineEdit(str(DEFAULT_RUNTIME_DIR), self)
         self.check_hook_edit = QLineEdit("", self)
         self.check_hook_edit.setPlaceholderText("可选：任务完成后运行的 Python 检查脚本")
+        for edit in (
+            self.chat_url_edit,
+            self.prompts_dir_edit,
+            self.output_dir_edit,
+            self.runtime_dir_edit,
+            self.check_hook_edit,
+        ):
+            edit.setMinimumWidth(60)
 
-        self.prompt_browse_button = QPushButton("选择", self)
-        self.output_browse_button = QPushButton("选择", self)
-        self.runtime_browse_button = QPushButton("选择", self)
-        self.check_hook_browse_button = QPushButton("选择", self)
+        self.prompt_browse_button = QPushButton("…", self)
+        self.output_browse_button = QPushButton("…", self)
+        self.runtime_browse_button = QPushButton("…", self)
+        self.check_hook_browse_button = QPushButton("…", self)
+        for btn in (
+            self.prompt_browse_button,
+            self.output_browse_button,
+            self.runtime_browse_button,
+            self.check_hook_browse_button,
+        ):
+            btn.setFixedWidth(28)
+            btn.setToolTip("选择…")
 
         self.account_count_spin = QSpinBox(self)
         self.account_count_spin.setRange(1, 2_147_483_647)
@@ -126,14 +142,14 @@ class MainWindow(QMainWindow):
         self.chat_mode_combo = QComboBox(self)
         self.chat_mode_combo.addItem("专家模式", "expert")
         self.chat_mode_combo.addItem("快速模式", "fast")
-        self.chat_mode_combo.addItem("保持当前页面模式", "keep")
+        self.chat_mode_combo.addItem("保持当前页面", "keep")
 
-        self.search_check = QCheckBox("启用智能搜索（网页搜索）", self)
+        self.search_check = QCheckBox("启用网页搜索", self)
         self.search_check.setChecked(True)
-        self.require_search_check = QCheckBox("找不到网页搜索按钮时暂停账号", self)
+        self.require_search_check = QCheckBox("找不到搜索按钮时暂停账号", self)
         self.require_search_check.setChecked(True)
         self.deepthink_check = QCheckBox("启用深度思考", self)
-        self.new_chat_check = QCheckBox("每个任务前尝试新对话", self)
+        self.new_chat_check = QCheckBox("每个任务前新对话", self)
         self.new_chat_check.setChecked(True)
         self.check_hook_enabled_check = QCheckBox("任务完成后运行检查脚本", self)
         self.check_hook_max_retries_spin = QSpinBox(self)
@@ -141,62 +157,88 @@ class MainWindow(QMainWindow):
         self.check_hook_max_retries_spin.setValue(2)
         self.check_hook_max_retries_spin.setSuffix(" 次")
 
+        spin_max_width = 110
+        for spin in (
+            self.account_count_spin,
+            self.min_delay_spin,
+            self.max_delay_spin,
+            self.poll_interval_spin,
+            self.stable_seconds_spin,
+            self.reply_timeout_spin,
+            self.check_hook_max_retries_spin,
+        ):
+            spin.setMaximumWidth(spin_max_width)
+        self.chat_mode_combo.setMaximumWidth(140)
+
         self.apply_accounts_button = QPushButton("应用账号数", self)
-        self.reload_all_button = QPushButton("全部打开 DeepSeek", self)
-        self.probe_layout_button = QPushButton("探测当前布局", self)
+        self.reload_all_button = QPushButton("全部打开", self)
+        self.probe_layout_button = QPushButton("探测布局", self)
         self.load_tasks_button = QPushButton("加载任务", self)
         self.start_button = QPushButton("开始", self)
         self.stop_button = QPushButton("停止", self)
         self.stop_button.setEnabled(False)
 
         path_grid = QGridLayout()
-        path_grid.addWidget(QLabel("DeepSeek 地址", self), 0, 0)
-        path_grid.addWidget(self.chat_url_edit, 0, 1, 1, 2)
-        path_grid.addWidget(QLabel("Prompt 目录", self), 1, 0)
+        path_grid.setHorizontalSpacing(6)
+        path_grid.addWidget(QLabel("地址", self), 0, 0)
+        path_grid.addWidget(self.chat_url_edit, 0, 1)
+        path_grid.addWidget(QLabel("Prompt", self), 1, 0)
         path_grid.addWidget(self.prompts_dir_edit, 1, 1)
         path_grid.addWidget(self.prompt_browse_button, 1, 2)
-        path_grid.addWidget(QLabel("输出目录", self), 2, 0)
+        path_grid.addWidget(QLabel("输出", self), 2, 0)
         path_grid.addWidget(self.output_dir_edit, 2, 1)
         path_grid.addWidget(self.output_browse_button, 2, 2)
-        path_grid.addWidget(QLabel("运行时目录", self), 3, 0)
+        path_grid.addWidget(QLabel("运行时", self), 3, 0)
         path_grid.addWidget(self.runtime_dir_edit, 3, 1)
         path_grid.addWidget(self.runtime_browse_button, 3, 2)
         path_grid.addWidget(QLabel("检查脚本", self), 4, 0)
         path_grid.addWidget(self.check_hook_edit, 4, 1)
         path_grid.addWidget(self.check_hook_browse_button, 4, 2)
+        path_grid.setColumnStretch(1, 1)
 
-        settings_form = QFormLayout()
-        settings_form.addRow("账号数", self.account_count_spin)
-        settings_form.addRow("最小随机间隔", self.min_delay_spin)
-        settings_form.addRow("最大随机间隔", self.max_delay_spin)
-        settings_form.addRow("轮询间隔", self.poll_interval_spin)
-        settings_form.addRow("回复稳定判定", self.stable_seconds_spin)
-        settings_form.addRow("回复超时", self.reply_timeout_spin)
-        settings_form.addRow("对话模式", self.chat_mode_combo)
-        settings_form.addRow("检查失败重试上限", self.check_hook_max_retries_spin)
+        settings_grid = QGridLayout()
+        settings_grid.setHorizontalSpacing(8)
+        settings_pairs = [
+            ("账号数", self.account_count_spin),
+            ("对话模式", self.chat_mode_combo),
+            ("最小间隔", self.min_delay_spin),
+            ("最大间隔", self.max_delay_spin),
+            ("轮询间隔", self.poll_interval_spin),
+            ("回复稳定", self.stable_seconds_spin),
+            ("回复超时", self.reply_timeout_spin),
+            ("重试上限", self.check_hook_max_retries_spin),
+        ]
+        for index, (text, widget) in enumerate(settings_pairs):
+            row, col = divmod(index, 2)
+            settings_grid.addWidget(QLabel(text, self), row, col * 2)
+            settings_grid.addWidget(widget, row, col * 2 + 1)
+        settings_grid.setColumnStretch(1, 1)
+        settings_grid.setColumnStretch(3, 1)
 
         mode_layout = QVBoxLayout()
+        mode_layout.setSpacing(4)
         mode_layout.addWidget(self.search_check)
         mode_layout.addWidget(self.require_search_check)
         mode_layout.addWidget(self.deepthink_check)
         mode_layout.addWidget(self.new_chat_check)
         mode_layout.addWidget(self.check_hook_enabled_check)
 
-        control_layout = QHBoxLayout()
-        control_layout.addWidget(self.apply_accounts_button)
-        control_layout.addWidget(self.reload_all_button)
-        control_layout.addWidget(self.probe_layout_button)
-        control_layout.addStretch(1)
-        control_layout.addWidget(self.load_tasks_button)
-        control_layout.addWidget(self.start_button)
-        control_layout.addWidget(self.stop_button)
+        control_grid = QGridLayout()
+        control_grid.setHorizontalSpacing(6)
+        control_grid.addWidget(self.apply_accounts_button, 0, 0)
+        control_grid.addWidget(self.reload_all_button, 0, 1)
+        control_grid.addWidget(self.probe_layout_button, 0, 2)
+        control_grid.addWidget(self.load_tasks_button, 1, 0)
+        control_grid.addWidget(self.start_button, 1, 1)
+        control_grid.addWidget(self.stop_button, 1, 2)
 
         config_box = QGroupBox("配置", self)
         config_layout = QVBoxLayout(config_box)
+        config_layout.setSpacing(8)
         config_layout.addLayout(path_grid)
-        config_layout.addLayout(settings_form)
+        config_layout.addLayout(settings_grid)
         config_layout.addLayout(mode_layout)
-        config_layout.addLayout(control_layout)
+        config_layout.addLayout(control_grid)
 
         self.task_table = QTableWidget(0, 4, self)
         self.task_table.setHorizontalHeaderLabels(["任务 ID", "状态", "账号", "Prompt 文件"])
@@ -204,6 +246,26 @@ class MainWindow(QMainWindow):
         self.task_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.task_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+
+        self.stats_table = QTableWidget(0, 5, self)
+        self.stats_table.setHorizontalHeaderLabels(["账号", "已分配", "成功", "失败", "平均耗时"])
+        self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.stats_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.stats_table.setMinimumWidth(0)
+        self.stats_table.horizontalHeader().setMinimumSectionSize(30)
+        for col in range(5):
+            mode = (
+                QHeaderView.ResizeMode.Stretch
+                if col == 4
+                else QHeaderView.ResizeMode.ResizeToContents
+            )
+            self.stats_table.horizontalHeader().setSectionResizeMode(col, mode)
+
+        stats_box = QGroupBox("账号使用情况", self)
+        stats_layout = QVBoxLayout(stats_box)
+        stats_layout.setContentsMargins(6, 6, 6, 6)
+        stats_layout.addWidget(self.stats_table)
 
         self.log_edit = QPlainTextEdit(self)
         self.log_edit.setReadOnly(True)
@@ -213,11 +275,12 @@ class MainWindow(QMainWindow):
         log_char_width = QFontMetrics(log_font).horizontalAdvance("M")
         log_default_width = log_char_width * 80 + 24
 
-        left_panel = QWidget(self)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.addWidget(config_box)
-        left_layout.addWidget(QLabel("任务", self))
-        left_layout.addWidget(self.task_table, 1)
+        self.left_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.left_splitter.addWidget(config_box)
+        self.left_splitter.addWidget(stats_box)
+        self.left_splitter.setStretchFactor(0, 1)
+        self.left_splitter.setStretchFactor(1, 0)
+        self.left_splitter.setSizes([600, 240])
 
         self.account_tabs = QTabWidget(self)
 
@@ -227,17 +290,30 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(QLabel("日志", self))
         log_layout.addWidget(self.log_edit, 1)
 
-        splitter = QSplitter(self)
-        splitter.addWidget(left_panel)
-        splitter.addWidget(self.account_tabs)
-        splitter.addWidget(log_panel)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([430, 760, log_default_width])
+        task_panel = QWidget(self)
+        task_layout = QVBoxLayout(task_panel)
+        task_layout.setContentsMargins(0, 0, 0, 0)
+        task_layout.addWidget(QLabel("任务", self))
+        task_layout.addWidget(self.task_table, 1)
+
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.right_splitter.addWidget(log_panel)
+        self.right_splitter.addWidget(task_panel)
+        self.right_splitter.setStretchFactor(0, 1)
+        self.right_splitter.setStretchFactor(1, 1)
+        self.right_splitter.setSizes([460, 360])
+
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.main_splitter.addWidget(self.left_splitter)
+        self.main_splitter.addWidget(self.account_tabs)
+        self.main_splitter.addWidget(self.right_splitter)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setSizes([300, 960, log_default_width + 60])
 
         main_layout = QVBoxLayout(central)
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(self.main_splitter, 1)
 
         self.prompt_browse_button.clicked.connect(lambda: self._choose_dir(self.prompts_dir_edit))
         self.output_browse_button.clicked.connect(lambda: self._choose_dir(self.output_dir_edit))
@@ -277,6 +353,14 @@ class MainWindow(QMainWindow):
             str(self.settings.value("check_hook_enabled", "false")).lower() == "true"
         )
         self.check_hook_max_retries_spin.setValue(int(self.settings.value("check_hook_max_retries", 2)))
+        for splitter, key in (
+            (self.main_splitter, "splitter_main_state"),
+            (self.left_splitter, "splitter_left_state"),
+            (self.right_splitter, "splitter_right_state"),
+        ):
+            state = self.settings.value(key)
+            if state:
+                splitter.restoreState(state)
 
     def _save_settings(self) -> None:
         self.settings.setValue("chat_url", self.chat_url_edit.text().strip())
@@ -297,6 +381,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("check_hook_path", self.check_hook_edit.text().strip())
         self.settings.setValue("check_hook_enabled", self.check_hook_enabled_check.isChecked())
         self.settings.setValue("check_hook_max_retries", self.check_hook_max_retries_spin.value())
+        self.settings.setValue("splitter_main_state", self.main_splitter.saveState())
+        self.settings.setValue("splitter_left_state", self.left_splitter.saveState())
+        self.settings.setValue("splitter_right_state", self.right_splitter.saveState())
         self.settings.sync()
 
     def _choose_dir(self, target: QLineEdit) -> None:
@@ -391,9 +478,11 @@ class MainWindow(QMainWindow):
             account = AccountPane(account_id, runtime_dir, chat_url, self)
             runner = AccountRunner(account, self)
             runner.status_changed.connect(self._runner_status_changed)
+            runner.stats_updated.connect(self._runner_stats_updated)
             self.accounts.append(account)
             self.runners.append(runner)
             self.account_tabs.addTab(account, f"账号 {account_id}")
+        self._refresh_stats_table()
         self.log(f"已加载 {len(self.accounts)} 个账号视图。首次使用请在各标签页手动登录。")
 
     def _dispose_runners(self) -> None:
@@ -649,6 +738,45 @@ class MainWindow(QMainWindow):
         index = account_id - 1
         if 0 <= index < self.account_tabs.count():
             self.account_tabs.setTabText(index, f"账号 {account_id} - {status}")
+
+    def _runner_stats_updated(self, account_id: int) -> None:
+        for row, runner in enumerate(self.runners):
+            if runner.account.account_id == account_id:
+                self._refresh_stats_row(row, runner)
+                return
+
+    def _refresh_stats_table(self) -> None:
+        self.stats_table.setRowCount(len(self.runners))
+        for row, runner in enumerate(self.runners):
+            self._refresh_stats_row(row, runner)
+
+    def _refresh_stats_row(self, row: int, runner: AccountRunner) -> None:
+        values = [
+            str(runner.account.account_id),
+            str(runner.assigned_count),
+            str(runner.success_count),
+            str(runner.failure_count),
+            self._format_duration(runner.avg_success_seconds),
+        ]
+        for col, text in enumerate(values):
+            item = self.stats_table.item(row, col)
+            if item is None:
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.stats_table.setItem(row, col, item)
+            else:
+                item.setText(text)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds <= 0:
+            return "-"
+        if seconds < 60:
+            return f"{seconds:.1f} 秒"
+        minutes = seconds / 60
+        if minutes < 60:
+            return f"{minutes:.1f} 分"
+        return f"{minutes / 60:.1f} 时"
 
     def closeEvent(self, event: Any) -> None:
         self._save_settings()
