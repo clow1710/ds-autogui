@@ -82,7 +82,7 @@ class MainWindow(QMainWindow):
         self.runtime_browse_button = QPushButton("选择", self)
 
         self.account_count_spin = QSpinBox(self)
-        self.account_count_spin.setRange(1, 3)
+        self.account_count_spin.setRange(1, 2_147_483_647)
         self.account_count_spin.setValue(1)
 
         self.min_delay_spin = QSpinBox(self)
