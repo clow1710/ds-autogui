@@ -36,6 +36,7 @@ class AccountRunner(QObject):
         self.total_success_seconds = 0.0
         self.pending_hook_output_path: Path | None = None
         self.next_action_deadline_monotonic = 0.0
+        self.baseline_bubble_count: int | None = None
 
     @property
     def avg_success_seconds(self) -> float:
@@ -85,7 +86,7 @@ class AccountRunner(QObject):
         if not self.running:
             return
 
-        task = self.window.take_next_task()
+        task = self.window.take_next_task(self.account.account_id)
         if task is None:
             self.running = False
             self.status_changed.emit(self.account.account_id, "无待处理任务")
@@ -97,6 +98,7 @@ class AccountRunner(QObject):
         self.last_change_monotonic = time.monotonic()
         self.poll_started_monotonic = 0.0
         self.task_start_monotonic = time.monotonic()
+        self.baseline_bubble_count = None
         self._record_assigned()
         self.window.mark_task(task.task_id, "准备发送", self.account.account_id)
         self.status_changed.emit(self.account.account_id, f"任务 {task.task_id}")
@@ -175,7 +177,7 @@ class AccountRunner(QObject):
         error = result.get("error") or result.get("warning") or "对话模式切换失败"
         self.running = False
         self._record_failure()
-        self.window.requeue_task(task)
+        self.window.requeue_task(task, self.account.account_id)
         self.window.mark_task(task.task_id, f"已重排：{error}", self.account.account_id)
         self.window.log(f"账号 {self.account.account_id} 未发送任务 {task.task_id}，已重排：{error}")
         self.status_changed.emit(self.account.account_id, "已暂停")
@@ -196,7 +198,7 @@ class AccountRunner(QObject):
         if not result.get("ok"):
             self.running = False
             self._record_failure()
-            self.window.requeue_task(task)
+            self.window.requeue_task(task, self.account.account_id)
             self.window.mark_task(task.task_id, f"已重排：{result.get('error')}", self.account.account_id)
             self.window.log(f"账号 {self.account.account_id} 未发送任务 {task.task_id}，已重排：{result.get('error')}")
             self.status_changed.emit(self.account.account_id, "已暂停")
@@ -204,6 +206,8 @@ class AccountRunner(QObject):
             self.window.runner_idle(self)
             return
 
+        baseline = result.get("baselineBubbleCount")
+        self.baseline_bubble_count = int(baseline) if isinstance(baseline, (int, float)) else None
         self.request_time = now_iso()
         self.poll_started_monotonic = time.monotonic()
         self.last_change_monotonic = self.poll_started_monotonic
@@ -215,7 +219,10 @@ class AccountRunner(QObject):
         if not self.running or self.current_task is None:
             return
         task = self.current_task
-        self.account.run_js(js_call("collectReply", task.prompt), self._after_poll)
+        self.account.run_js(
+            js_call("collectReply", task.prompt, self.baseline_bubble_count),
+            self._after_poll,
+        )
 
     def _after_poll(self, result: dict[str, Any]) -> None:
         if not self.running or self.current_task is None:
@@ -226,7 +233,7 @@ class AccountRunner(QObject):
 
         if result.get("ok") and result.get("serverBusy"):
             cooldown_ms = self.window.busy_cooldown_ms()
-            self.window.requeue_task(task)
+            self.window.requeue_task(task, self.account.account_id)
             self.window.mark_task(
                 task.task_id,
                 f"服务器繁忙，{cooldown_ms / 1000:.0f}s 后重试",
@@ -357,7 +364,7 @@ class AccountRunner(QObject):
                 self.window.log(
                     f"账号 {self.account.account_id} 校验失败但删除输出 {output_path} 失败：{exc}"
                 )
-            self.window.requeue_task(task)
+            self.window.requeue_task(task, self.account.account_id)
             self.window.mark_task(
                 task.task_id,
                 f"校验失败 第{attempts}/{max_retries}次 已重排：{reason}",
@@ -391,7 +398,7 @@ class AccountRunner(QObject):
         self.running = False
         self._record_failure()
         if self.current_task is not None and self.current_task.task_id == task_id:
-            self.window.requeue_task(self.current_task)
+            self.window.requeue_task(self.current_task, self.account.account_id)
             status = f"写入失败已重排：{error}"
             log_message = f"账号 {self.account.account_id} 写入任务 {task_id} 失败，已重排：{error}"
         else:

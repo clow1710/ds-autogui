@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self.resize(1820, 900)
         self.settings = QSettings("codex-local", "deepseek-batch-gui")
         self.tasks: Deque[PromptTask] = deque()
+        self.account_task_queues: dict[int, Deque[PromptTask]] = {}
         self.task_rows: dict[str, int] = {}
         self.accounts: list[AccountPane] = []
         self.runners: list[AccountRunner] = []
@@ -147,6 +148,10 @@ class MainWindow(QMainWindow):
         self.busy_cooldown_spin.setRange(10, 3600)
         self.busy_cooldown_spin.setValue(120)
         self.busy_cooldown_spin.setSuffix(" 秒")
+        self.startup_delay_spin = QSpinBox(self)
+        self.startup_delay_spin.setRange(0, 600)
+        self.startup_delay_spin.setValue(10)
+        self.startup_delay_spin.setSuffix(" 秒")
 
         self.chat_mode_combo = QComboBox(self)
         self.chat_mode_combo.addItem("专家模式", "expert")
@@ -161,6 +166,7 @@ class MainWindow(QMainWindow):
         self.new_chat_check = QCheckBox("每个任务前新对话", self)
         self.new_chat_check.setChecked(True)
         self.check_hook_enabled_check = QCheckBox("任务完成后运行检查脚本", self)
+        self.random_assign_check = QCheckBox("随机分配任务到账号", self)
         self.check_hook_max_retries_spin = QSpinBox(self)
         self.check_hook_max_retries_spin.setRange(0, 20)
         self.check_hook_max_retries_spin.setValue(2)
@@ -175,6 +181,7 @@ class MainWindow(QMainWindow):
             self.stable_seconds_spin,
             self.reply_timeout_spin,
             self.busy_cooldown_spin,
+            self.startup_delay_spin,
             self.check_hook_max_retries_spin,
         ):
             spin.setMaximumWidth(spin_max_width)
@@ -213,6 +220,7 @@ class MainWindow(QMainWindow):
             ("对话模式", self.chat_mode_combo),
             ("最小间隔", self.min_delay_spin),
             ("最大间隔", self.max_delay_spin),
+            ("启动间隔", self.startup_delay_spin),
             ("轮询间隔", self.poll_interval_spin),
             ("回复稳定", self.stable_seconds_spin),
             ("回复超时", self.reply_timeout_spin),
@@ -233,6 +241,7 @@ class MainWindow(QMainWindow):
         mode_layout.addWidget(self.deepthink_check)
         mode_layout.addWidget(self.new_chat_check)
         mode_layout.addWidget(self.check_hook_enabled_check)
+        mode_layout.addWidget(self.random_assign_check)
 
         control_grid = QGridLayout()
         control_grid.setHorizontalSpacing(6)
@@ -355,6 +364,7 @@ class MainWindow(QMainWindow):
         self.stable_seconds_spin.setValue(int(self.settings.value("stable_seconds", 8)))
         self.reply_timeout_spin.setValue(int(self.settings.value("reply_timeout", 900)))
         self.busy_cooldown_spin.setValue(int(self.settings.value("busy_cooldown", 120)))
+        self.startup_delay_spin.setValue(int(self.settings.value("startup_delay", 10)))
         chat_mode = str(self.settings.value("chat_mode", "expert"))
         chat_mode_index = self.chat_mode_combo.findData(chat_mode)
         if chat_mode_index < 0:
@@ -369,6 +379,9 @@ class MainWindow(QMainWindow):
             str(self.settings.value("check_hook_enabled", "false")).lower() == "true"
         )
         self.check_hook_max_retries_spin.setValue(int(self.settings.value("check_hook_max_retries", 2)))
+        self.random_assign_check.setChecked(
+            str(self.settings.value("random_assign", "false")).lower() == "true"
+        )
         for splitter, key in (
             (self.main_splitter, "splitter_main_state"),
             (self.left_splitter, "splitter_left_state"),
@@ -390,6 +403,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("stable_seconds", self.stable_seconds_spin.value())
         self.settings.setValue("reply_timeout", self.reply_timeout_spin.value())
         self.settings.setValue("busy_cooldown", self.busy_cooldown_spin.value())
+        self.settings.setValue("startup_delay", self.startup_delay_spin.value())
         self.settings.setValue("chat_mode", self.chat_mode_combo.currentData() or "expert")
         self.settings.setValue("search_enabled", self.search_check.isChecked())
         self.settings.setValue("require_search", self.require_search_check.isChecked())
@@ -398,6 +412,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("check_hook_path", self.check_hook_edit.text().strip())
         self.settings.setValue("check_hook_enabled", self.check_hook_enabled_check.isChecked())
         self.settings.setValue("check_hook_max_retries", self.check_hook_max_retries_spin.value())
+        self.settings.setValue("random_assign", self.random_assign_check.isChecked())
         self.settings.setValue("splitter_main_state", self.main_splitter.saveState())
         self.settings.setValue("splitter_left_state", self.left_splitter.saveState())
         self.settings.setValue("splitter_right_state", self.right_splitter.saveState())
@@ -566,6 +581,7 @@ class MainWindow(QMainWindow):
 
         self._save_settings()
         self.tasks.clear()
+        self.account_task_queues.clear()
         self.task_rows.clear()
         self.hook_retries.clear()
         self.task_table.setRowCount(0)
@@ -633,12 +649,24 @@ class MainWindow(QMainWindow):
         if account_item is not None:
             account_item.setText(str(account_id))
 
-    def take_next_task(self) -> PromptTask | None:
+    def take_next_task(self, account_id: int | None = None) -> PromptTask | None:
+        if self.account_task_queues:
+            if account_id is None:
+                return None
+            queue = self.account_task_queues.get(account_id)
+            if queue:
+                return queue.popleft()
+            return None
         if not self.tasks:
             return None
         return self.tasks.popleft()
 
-    def requeue_task(self, task: PromptTask) -> None:
+    def requeue_task(self, task: PromptTask, account_id: int | None = None) -> None:
+        if self.account_task_queues and account_id is not None:
+            queue = self.account_task_queues.get(account_id)
+            if queue is not None:
+                queue.appendleft(task)
+                return
         self.tasks.appendleft(task)
 
     def write_result_async(
@@ -716,7 +744,8 @@ class MainWindow(QMainWindow):
             self.log("任务仍在后台加载，加载完成后会自动开始。")
             return
 
-        if not self.tasks:
+        has_queued = bool(self.tasks) or any(self.account_task_queues.values())
+        if not has_queued:
             self.start_requested_after_load = True
             self.load_tasks()
             return
@@ -727,11 +756,40 @@ class MainWindow(QMainWindow):
         self.load_tasks_button.setEnabled(False)
         self.apply_accounts_button.setEnabled(False)
 
-        cumulative_delay = 0
-        for index, runner in enumerate(self.runners):
-            if index > 0:
-                cumulative_delay += self.random_delay_ms()
-            runner.start_after(cumulative_delay)
+        startup_step_ms = int(self.startup_delay_spin.value()) * 1000
+        startup_runners = list(self.runners)
+        if self.account_task_queues:
+            for queue in self.account_task_queues.values():
+                self.tasks.extend(queue)
+            self.account_task_queues.clear()
+
+        if self.random_assign_check.isChecked() and self.runners:
+            pending = list(self.tasks)
+            random.shuffle(pending)
+            queues: dict[int, Deque[PromptTask]] = {
+                runner.account.account_id: deque() for runner in self.runners
+            }
+            assignment_order: list[int] = []
+            seen: set[int] = set()
+            for task in pending:
+                runner = random.choice(self.runners)
+                account_id = runner.account.account_id
+                queues[account_id].append(task)
+                if account_id not in seen:
+                    seen.add(account_id)
+                    assignment_order.append(account_id)
+                self.mark_task(task.task_id, "已分配", account_id)
+            self.account_task_queues = queues
+            self.tasks.clear()
+
+            runners_by_id = {r.account.account_id: r for r in self.runners}
+            startup_runners = [runners_by_id[aid] for aid in assignment_order]
+            self.log(
+                f"已随机分配 {len(pending)} 个任务到 {len(assignment_order)} 个账号。"
+            )
+
+        for index, runner in enumerate(startup_runners):
+            runner.start_after(index * startup_step_ms)
         self.log("批处理已启动。遇到验证码、风控或登录过期时，请在对应账号标签页手动处理后重新开始。")
 
     def stop_batch(self) -> None:

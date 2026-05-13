@@ -6,7 +6,7 @@ from typing import Any
 
 AUTOMATION_JS = r"""
 (function () {
-  const BOT_VERSION = "2026-05-14-busy-detect-1";
+  const BOT_VERSION = "2026-05-14-busy-detect-3";
   if (window.__deepseekBatchBot && window.__deepseekBatchBot.version === BOT_VERSION) {
     return;
   }
@@ -469,18 +469,98 @@ AUTOMATION_JS = r"""
     ], prompt);
   }
 
-  function isServerBusy() {
-    const phrases = ["服务器繁忙", "Server busy"];
-    const all = document.querySelectorAll("body *");
-    for (const el of all) {
-      if (!visible(el)) continue;
-      const own = norm(el.innerText || el.textContent || "");
-      if (!own || own.length > 80) continue;
-      for (const phrase of phrases) {
-        if (own.includes(phrase)) return true;
+  const SERVER_BUSY_PHRASES = ["服务器繁忙", "Server busy"];
+  const PRIMARY_BUBBLE_SELECTORS = [".ds-message"];
+  const FALLBACK_BUBBLE_SELECTORS = [
+    ".ds-assistant-message-main-content",
+    ".ds-message-content",
+    "[data-message-author-role]",
+    "[data-role='assistant']",
+    "[data-role='user']"
+  ];
+  const CONVERSATION_AREA_SELECTORS = [
+    ".ds-virtual-list",
+    ".ds-message",
+    ".ds-markdown",
+    ".ds-assistant-message-main-content",
+    ".ds-message-content",
+    "[data-message-author-role]",
+    "[data-role='assistant']",
+    "[data-role='user']"
+  ];
+
+  function textHasBusyPhrase(text, mode) {
+    if (!text) return false;
+    for (const phrase of SERVER_BUSY_PHRASES) {
+      if (mode === "startsWith") {
+        if (text.startsWith(phrase)) return true;
+      } else {
+        if (text.includes(phrase)) return true;
       }
     }
     return false;
+  }
+
+  function elementMatchesAncestor(el, selectors) {
+    if (!el || typeof el.closest !== "function") return false;
+    for (const selector of selectors) {
+      if (el.closest(selector)) return true;
+    }
+    return false;
+  }
+
+  function listVisibleBubbles() {
+    const seen = new Set();
+    const list = [];
+    const tryCollect = (selectors) => {
+      for (const selector of selectors) {
+        for (const el of Array.from(document.querySelectorAll(selector))) {
+          if (seen.has(el) || !visible(el)) continue;
+          seen.add(el);
+          list.push(el);
+        }
+      }
+    };
+    tryCollect(PRIMARY_BUBBLE_SELECTORS);
+    if (list.length === 0) tryCollect(FALLBACK_BUBBLE_SELECTORS);
+    list.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    return list;
+  }
+
+  function countMessageBubbles() {
+    return listVisibleBubbles().length;
+  }
+
+  function hasFreshBusyMessage(baselineBubbleCount, currentBubbleCount, prompt) {
+    if (typeof baselineBubbleCount !== "number" || typeof currentBubbleCount !== "number") return false;
+    const delta = currentBubbleCount - baselineBubbleCount;
+    if (delta <= 0) return false;
+    const bubbles = listVisibleBubbles();
+    if (bubbles.length === 0) return false;
+    const fresh = bubbles.slice(-delta);
+    for (const el of fresh) {
+      const text = norm(el.innerText || el.textContent || "");
+      if (!text || text.length > 200) continue;
+      if (prompt && looksLikePrompt(text, prompt)) continue;
+      if (textHasBusyPhrase(text, "startsWith")) return true;
+    }
+    return false;
+  }
+
+  function hasBusyToast() {
+    const all = document.querySelectorAll("body *");
+    for (const el of all) {
+      if (!visible(el) || elementMatchesAncestor(el, CONVERSATION_AREA_SELECTORS)) continue;
+      const own = norm(el.innerText || el.textContent || "");
+      if (!own || own.length > 40) continue;
+      if (textHasBusyPhrase(own, "startsWith")) return true;
+    }
+    return false;
+  }
+
+  function isServerBusy(baselineBubbleCount, currentBubbleCount, prompt) {
+    if (hasFreshBusyMessage(baselineBubbleCount, currentBubbleCount, prompt)) return true;
+    return hasBusyToast();
   }
 
   function isGenerating() {
@@ -800,24 +880,30 @@ AUTOMATION_JS = r"""
       if (!enabled(sendButton)) {
         return { ok: false, error: "发送按钮当前不可用", modeResults };
       }
+      const baselineBubbleCount = countMessageBubbles();
       sendButton.click();
-      return { ok: true, modeResults };
+      return { ok: true, modeResults, baselineBubbleCount };
     } catch (err) {
       return { ok: false, error: String(err && err.message ? err.message : err) };
     }
   };
 
-  bot.collectReply = function (prompt) {
+  bot.collectReply = function (prompt, baselineBubbleCount) {
     try {
       const candidates = collectCandidates(prompt);
       const latest = candidates.length ? candidates[candidates.length - 1].text : "";
+      const candidateCount = candidates.length;
+      const bubbleCount = countMessageBubbles();
+      const baseline = typeof baselineBubbleCount === "number" ? baselineBubbleCount : null;
       return {
         ok: true,
         content: latest,
         length: latest.length,
         generating: isGenerating(),
-        serverBusy: isServerBusy(),
-        candidateCount: candidates.length
+        serverBusy: isServerBusy(baseline, bubbleCount, prompt),
+        candidateCount,
+        bubbleCount,
+        baselineBubbleCount: baseline
       };
     } catch (err) {
       return { ok: false, error: String(err && err.message ? err.message : err) };
