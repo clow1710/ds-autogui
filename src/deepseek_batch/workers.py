@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from .models import PromptTask, ResultPayload, ResultWriteResult, TaskLoadResult, TaskRow
+from .models import (
+    CheckHookResult,
+    PromptTask,
+    ResultPayload,
+    ResultWriteResult,
+    TaskLoadResult,
+    TaskRow,
+)
 
 
 class TaskLoadWorker(QObject):
@@ -87,4 +97,58 @@ class ResultWriteWorker(QObject):
             self.finished.emit(ResultWriteResult(task.task_id, output_path))
         except Exception as exc:  # noqa: BLE001 - worker boundary reports failures to GUI.
             self.failed.emit(task.task_id, str(exc))
+
+
+class CheckHookWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str, str)
+
+    def __init__(
+        self,
+        task_id: str,
+        hook_path: Path,
+        output_path: Path,
+        prompt_path: Path,
+        timeout_seconds: int = 180,
+    ) -> None:
+        super().__init__()
+        self.task_id = task_id
+        self.hook_path = hook_path
+        self.output_path = output_path
+        self.prompt_path = prompt_path
+        self.timeout_seconds = timeout_seconds
+
+    @Slot()
+    def run(self) -> None:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(self.hook_path),
+                    str(self.output_path),
+                    str(self.prompt_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout_seconds,
+                check=False,
+                env=env,
+            )
+            self.finished.emit(
+                CheckHookResult(
+                    task_id=self.task_id,
+                    output_path=self.output_path,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout or "",
+                    stderr=proc.stderr or "",
+                )
+            )
+        except subprocess.TimeoutExpired:
+            self.failed.emit(self.task_id, f"检查脚本超时（>{self.timeout_seconds}s）")
+        except Exception as exc:  # noqa: BLE001 - worker boundary reports failures to GUI.
+            self.failed.emit(self.task_id, str(exc))
 

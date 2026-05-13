@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque
 
 from PySide6.QtCore import QSettings, QThread, QTimer
+from PySide6.QtGui import QFontDatabase, QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -45,16 +46,23 @@ from .config import (
     SEARCH_TERMS,
 )
 from .js_bridge import js_call
-from .models import PromptTask, ResultPayload, ResultWriteResult, TaskLoadResult, TaskRow
+from .models import (
+    CheckHookResult,
+    PromptTask,
+    ResultPayload,
+    ResultWriteResult,
+    TaskLoadResult,
+    TaskRow,
+)
 from .runner import AccountRunner
-from .workers import ResultWriteWorker, TaskLoadWorker
+from .workers import CheckHookWorker, ResultWriteWorker, TaskLoadWorker
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DeepSeek 网页批量任务")
-        self.resize(1400, 900)
+        self.resize(1820, 900)
         self.settings = QSettings("codex-local", "deepseek-batch-gui")
         self.tasks: Deque[PromptTask] = deque()
         self.task_rows: dict[str, int] = {}
@@ -64,6 +72,9 @@ class MainWindow(QMainWindow):
         self.task_load_worker: TaskLoadWorker | None = None
         self.result_threads: list[QThread] = []
         self.result_workers: list[ResultWriteWorker] = []
+        self.hook_threads: list[QThread] = []
+        self.hook_workers: list[CheckHookWorker] = []
+        self.hook_retries: dict[str, int] = {}
         self.start_requested_after_load = False
 
         self._build_ui()
@@ -78,10 +89,13 @@ class MainWindow(QMainWindow):
         self.prompts_dir_edit = QLineEdit(str(DEFAULT_PROMPTS_DIR), self)
         self.output_dir_edit = QLineEdit(str(DEFAULT_OUTPUT_DIR), self)
         self.runtime_dir_edit = QLineEdit(str(DEFAULT_RUNTIME_DIR), self)
+        self.check_hook_edit = QLineEdit("", self)
+        self.check_hook_edit.setPlaceholderText("可选：任务完成后运行的 Python 检查脚本")
 
         self.prompt_browse_button = QPushButton("选择", self)
         self.output_browse_button = QPushButton("选择", self)
         self.runtime_browse_button = QPushButton("选择", self)
+        self.check_hook_browse_button = QPushButton("选择", self)
 
         self.account_count_spin = QSpinBox(self)
         self.account_count_spin.setRange(1, 2_147_483_647)
@@ -121,6 +135,11 @@ class MainWindow(QMainWindow):
         self.deepthink_check = QCheckBox("启用深度思考", self)
         self.new_chat_check = QCheckBox("每个任务前尝试新对话", self)
         self.new_chat_check.setChecked(True)
+        self.check_hook_enabled_check = QCheckBox("任务完成后运行检查脚本", self)
+        self.check_hook_max_retries_spin = QSpinBox(self)
+        self.check_hook_max_retries_spin.setRange(0, 20)
+        self.check_hook_max_retries_spin.setValue(2)
+        self.check_hook_max_retries_spin.setSuffix(" 次")
 
         self.apply_accounts_button = QPushButton("应用账号数", self)
         self.reload_all_button = QPushButton("全部打开 DeepSeek", self)
@@ -142,6 +161,9 @@ class MainWindow(QMainWindow):
         path_grid.addWidget(QLabel("运行时目录", self), 3, 0)
         path_grid.addWidget(self.runtime_dir_edit, 3, 1)
         path_grid.addWidget(self.runtime_browse_button, 3, 2)
+        path_grid.addWidget(QLabel("检查脚本", self), 4, 0)
+        path_grid.addWidget(self.check_hook_edit, 4, 1)
+        path_grid.addWidget(self.check_hook_browse_button, 4, 2)
 
         settings_form = QFormLayout()
         settings_form.addRow("账号数", self.account_count_spin)
@@ -151,12 +173,14 @@ class MainWindow(QMainWindow):
         settings_form.addRow("回复稳定判定", self.stable_seconds_spin)
         settings_form.addRow("回复超时", self.reply_timeout_spin)
         settings_form.addRow("对话模式", self.chat_mode_combo)
+        settings_form.addRow("检查失败重试上限", self.check_hook_max_retries_spin)
 
         mode_layout = QVBoxLayout()
         mode_layout.addWidget(self.search_check)
         mode_layout.addWidget(self.require_search_check)
         mode_layout.addWidget(self.deepthink_check)
         mode_layout.addWidget(self.new_chat_check)
+        mode_layout.addWidget(self.check_hook_enabled_check)
 
         control_layout = QHBoxLayout()
         control_layout.addWidget(self.apply_accounts_button)
@@ -184,21 +208,33 @@ class MainWindow(QMainWindow):
         self.log_edit = QPlainTextEdit(self)
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumBlockCount(2000)
+        log_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        self.log_edit.setFont(log_font)
+        log_char_width = QFontMetrics(log_font).horizontalAdvance("M")
+        log_default_width = log_char_width * 80 + 24
 
         left_panel = QWidget(self)
         left_layout = QVBoxLayout(left_panel)
         left_layout.addWidget(config_box)
         left_layout.addWidget(QLabel("任务", self))
-        left_layout.addWidget(self.task_table, 2)
-        left_layout.addWidget(QLabel("日志", self))
-        left_layout.addWidget(self.log_edit, 1)
+        left_layout.addWidget(self.task_table, 1)
 
         self.account_tabs = QTabWidget(self)
+
+        log_panel = QWidget(self)
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(QLabel("日志", self))
+        log_layout.addWidget(self.log_edit, 1)
 
         splitter = QSplitter(self)
         splitter.addWidget(left_panel)
         splitter.addWidget(self.account_tabs)
-        splitter.setSizes([430, 970])
+        splitter.addWidget(log_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([430, 760, log_default_width])
 
         main_layout = QVBoxLayout(central)
         main_layout.addWidget(splitter, 1)
@@ -206,6 +242,7 @@ class MainWindow(QMainWindow):
         self.prompt_browse_button.clicked.connect(lambda: self._choose_dir(self.prompts_dir_edit))
         self.output_browse_button.clicked.connect(lambda: self._choose_dir(self.output_dir_edit))
         self.runtime_browse_button.clicked.connect(lambda: self._choose_dir(self.runtime_dir_edit))
+        self.check_hook_browse_button.clicked.connect(self._choose_check_hook_file)
         self.apply_accounts_button.clicked.connect(self.rebuild_accounts)
         self.reload_all_button.clicked.connect(self.reload_all_accounts)
         self.probe_layout_button.clicked.connect(self.probe_current_layout)
@@ -235,6 +272,11 @@ class MainWindow(QMainWindow):
         self.require_search_check.setChecked(str(self.settings.value("require_search", "true")).lower() == "true")
         self.deepthink_check.setChecked(str(self.settings.value("deepthink_enabled", "false")).lower() == "true")
         self.new_chat_check.setChecked(str(self.settings.value("new_chat", "true")).lower() == "true")
+        self.check_hook_edit.setText(str(self.settings.value("check_hook_path", "")))
+        self.check_hook_enabled_check.setChecked(
+            str(self.settings.value("check_hook_enabled", "false")).lower() == "true"
+        )
+        self.check_hook_max_retries_spin.setValue(int(self.settings.value("check_hook_max_retries", 2)))
 
     def _save_settings(self) -> None:
         self.settings.setValue("chat_url", self.chat_url_edit.text().strip())
@@ -252,6 +294,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("require_search", self.require_search_check.isChecked())
         self.settings.setValue("deepthink_enabled", self.deepthink_check.isChecked())
         self.settings.setValue("new_chat", self.new_chat_check.isChecked())
+        self.settings.setValue("check_hook_path", self.check_hook_edit.text().strip())
+        self.settings.setValue("check_hook_enabled", self.check_hook_enabled_check.isChecked())
+        self.settings.setValue("check_hook_max_retries", self.check_hook_max_retries_spin.value())
         self.settings.sync()
 
     def _choose_dir(self, target: QLineEdit) -> None:
@@ -259,6 +304,17 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "选择目录", start)
         if directory:
             target.setText(directory)
+
+    def _choose_check_hook_file(self) -> None:
+        start = self.check_hook_edit.text().strip() or str(PROJECT_DIR)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择检查脚本",
+            start,
+            "Python 脚本 (*.py);;所有文件 (*)",
+        )
+        if path:
+            self.check_hook_edit.setText(path)
 
     def _normalize_delay_bounds(self) -> None:
         if self.min_delay_spin.value() > self.max_delay_spin.value():
@@ -278,6 +334,27 @@ class MainWindow(QMainWindow):
 
     def output_path_for(self, task: PromptTask) -> Path:
         return self.output_dir() / f"{task.task_id}.json"
+
+    def check_hook_enabled(self) -> bool:
+        return self.check_hook_enabled_check.isChecked() and bool(
+            self.check_hook_edit.text().strip()
+        )
+
+    def check_hook_path(self) -> Path | None:
+        text = self.check_hook_edit.text().strip()
+        if not text:
+            return None
+        return Path(text).expanduser().resolve()
+
+    def check_hook_max_retries(self) -> int:
+        return self.check_hook_max_retries_spin.value()
+
+    def bump_hook_retry(self, task_id: str) -> int:
+        self.hook_retries[task_id] = self.hook_retries.get(task_id, 0) + 1
+        return self.hook_retries[task_id]
+
+    def reset_hook_retry(self, task_id: str) -> None:
+        self.hook_retries.pop(task_id, None)
 
     def automation_options(self) -> dict[str, Any]:
         return {
@@ -381,6 +458,7 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self.tasks.clear()
         self.task_rows.clear()
+        self.hook_retries.clear()
         self.task_table.setRowCount(0)
         self.load_tasks_button.setEnabled(False)
         self.log("正在后台扫描 prompt 目录。")
@@ -482,6 +560,46 @@ class MainWindow(QMainWindow):
         if worker in self.result_workers:
             self.result_workers.remove(worker)
 
+    def run_check_hook_async(
+        self,
+        task: PromptTask,
+        output_path: Path,
+        on_done: Callable[[CheckHookResult], None],
+        on_failed: Callable[[str, str], None],
+    ) -> None:
+        hook_path = self.check_hook_path()
+        if hook_path is None:
+            on_failed(task.task_id, "未配置检查脚本路径")
+            return
+
+        thread = QThread(self)
+        worker = CheckHookWorker(
+            task_id=task.task_id,
+            hook_path=hook_path,
+            output_path=output_path,
+            prompt_path=task.prompt_path,
+        )
+        worker.moveToThread(thread)
+
+        worker.finished.connect(on_done)
+        worker.failed.connect(on_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.started.connect(worker.run)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._cleanup_hook_worker(thread, worker))
+
+        self.hook_threads.append(thread)
+        self.hook_workers.append(worker)
+        thread.start()
+
+    def _cleanup_hook_worker(self, thread: QThread, worker: CheckHookWorker) -> None:
+        if thread in self.hook_threads:
+            self.hook_threads.remove(thread)
+        if worker in self.hook_workers:
+            self.hook_workers.remove(worker)
+
     def start_batch(self) -> None:
         if self.task_load_thread is not None:
             self.start_requested_after_load = True
@@ -540,6 +658,9 @@ class MainWindow(QMainWindow):
             self.task_load_thread.quit()
             self.task_load_thread.wait(1500)
         for thread in list(self.result_threads):
+            thread.quit()
+            thread.wait(1500)
+        for thread in list(self.hook_threads):
             thread.quit()
             thread.wait(1500)
         self._dispose_runners()

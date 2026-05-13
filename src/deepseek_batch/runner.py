@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .account import AccountPane
 from .js_bridge import js_call
-from .models import PromptTask, ResultPayload, ResultWriteResult
+from .models import CheckHookResult, PromptTask, ResultPayload, ResultWriteResult
 from .utils import now_iso
 
 if TYPE_CHECKING:
@@ -224,10 +225,89 @@ class AccountRunner(QObject):
         if self.current_task is None:
             return
         task = self.current_task
-        self.window.mark_task(task.task_id, "完成", self.account.account_id)
-        self.window.log(f"账号 {self.account.account_id} 完成任务 {task.task_id} -> {result.output_path}")
-        self.current_task = None
+        self.window.log(f"账号 {self.account.account_id} 写入任务 {task.task_id} -> {result.output_path}")
 
+        if self.window.check_hook_enabled():
+            self.window.mark_task(task.task_id, "校验中", self.account.account_id)
+            self.status_changed.emit(self.account.account_id, f"任务 {task.task_id} 校验中")
+            self.window.run_check_hook_async(
+                task,
+                result.output_path,
+                lambda check_result, t=task, p=result.output_path: self._after_check_hook(t, p, check_result),
+                lambda task_id, error, t=task, p=result.output_path: self._after_check_hook_error(t, p, error),
+            )
+            return
+
+        self.window.mark_task(task.task_id, "完成", self.account.account_id)
+        self.window.reset_hook_retry(task.task_id)
+        self._continue_after_task()
+
+    def _after_check_hook(
+        self,
+        task: PromptTask,
+        output_path: Path,
+        result: CheckHookResult,
+    ) -> None:
+        if self.current_task is None or self.current_task.task_id != task.task_id:
+            return
+
+        if result.passed:
+            self.window.mark_task(task.task_id, "完成（校验通过）", self.account.account_id)
+            self.window.log(f"账号 {self.account.account_id} 任务 {task.task_id} 校验通过")
+            self.window.reset_hook_retry(task.task_id)
+            self._continue_after_task()
+            return
+
+        stderr_tail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else ""
+        stdout_tail = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        reason = stderr_tail or stdout_tail or f"退出码 {result.returncode}"
+        self._handle_check_failure(task, output_path, reason)
+
+    def _after_check_hook_error(
+        self,
+        task: PromptTask,
+        output_path: Path,
+        error: str,
+    ) -> None:
+        if self.current_task is None or self.current_task.task_id != task.task_id:
+            return
+        self._handle_check_failure(task, output_path, f"检查脚本异常：{error}")
+
+    def _handle_check_failure(self, task: PromptTask, output_path: Path, reason: str) -> None:
+        attempts = self.window.bump_hook_retry(task.task_id)
+        max_retries = self.window.check_hook_max_retries()
+        if attempts <= max_retries:
+            try:
+                output_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.window.log(
+                    f"账号 {self.account.account_id} 校验失败但删除输出 {output_path} 失败：{exc}"
+                )
+            self.window.requeue_task(task)
+            self.window.mark_task(
+                task.task_id,
+                f"校验失败 第{attempts}/{max_retries}次 已重排：{reason}",
+                self.account.account_id,
+            )
+            self.window.log(
+                f"账号 {self.account.account_id} 任务 {task.task_id} 第 {attempts} 次校验失败，已重排：{reason}"
+            )
+        else:
+            self.window.mark_task(
+                task.task_id,
+                f"校验失败 达上限({max_retries})：{reason}",
+                self.account.account_id,
+            )
+            self.window.log(
+                f"账号 {self.account.account_id} 任务 {task.task_id} 校验失败达上限 {max_retries}，已保留输出：{reason}"
+            )
+            self.window.reset_hook_retry(task.task_id)
+        self._continue_after_task()
+
+    def _continue_after_task(self) -> None:
+        self.current_task = None
         if not self.running:
             self.window.runner_idle(self)
             return

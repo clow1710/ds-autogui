@@ -43,3 +43,16 @@ class ResultWriteResult:
     task_id: str
     output_path: Path
 
+
+@dataclass(frozen=True)
+class CheckHookResult:
+    task_id: str
+    output_path: Path
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def passed(self) -> bool:
+        return self.returncode == 0
+
