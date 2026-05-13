@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 from collections import deque
 from datetime import datetime
@@ -43,6 +44,7 @@ from .config import (
     PROJECT_DIR,
     SEARCH_TERMS,
 )
+from .js_bridge import js_call
 from .models import PromptTask, ResultPayload, ResultWriteResult, TaskLoadResult, TaskRow
 from .runner import AccountRunner
 from .workers import ResultWriteWorker, TaskLoadWorker
@@ -122,6 +124,7 @@ class MainWindow(QMainWindow):
 
         self.apply_accounts_button = QPushButton("应用账号数", self)
         self.reload_all_button = QPushButton("全部打开 DeepSeek", self)
+        self.probe_layout_button = QPushButton("探测当前布局", self)
         self.load_tasks_button = QPushButton("加载任务", self)
         self.start_button = QPushButton("开始", self)
         self.stop_button = QPushButton("停止", self)
@@ -158,6 +161,7 @@ class MainWindow(QMainWindow):
         control_layout = QHBoxLayout()
         control_layout.addWidget(self.apply_accounts_button)
         control_layout.addWidget(self.reload_all_button)
+        control_layout.addWidget(self.probe_layout_button)
         control_layout.addStretch(1)
         control_layout.addWidget(self.load_tasks_button)
         control_layout.addWidget(self.start_button)
@@ -204,6 +208,7 @@ class MainWindow(QMainWindow):
         self.runtime_browse_button.clicked.connect(lambda: self._choose_dir(self.runtime_dir_edit))
         self.apply_accounts_button.clicked.connect(self.rebuild_accounts)
         self.reload_all_button.clicked.connect(self.reload_all_accounts)
+        self.probe_layout_button.clicked.connect(self.probe_current_layout)
         self.load_tasks_button.clicked.connect(self.load_tasks)
         self.start_button.clicked.connect(self.start_batch)
         self.stop_button.clicked.connect(self.stop_batch)
@@ -334,6 +339,40 @@ class MainWindow(QMainWindow):
             account.chat_url = chat_url
             account.load_chat()
         self.log("已打开 DeepSeek 登录/聊天页面。")
+
+    def probe_current_layout(self) -> None:
+        widget = self.account_tabs.currentWidget()
+        if not isinstance(widget, AccountPane):
+            QMessageBox.information(self, "没有账号", "当前没有可探测的账号页面。")
+            return
+
+        self._save_settings()
+        self.probe_layout_button.setEnabled(False)
+        self.log(f"正在探测账号 {widget.account_id} 当前页面布局。")
+        widget.run_js(
+            js_call("probeLayout"),
+            lambda result, account=widget: self._layout_probe_done(account, result),
+        )
+
+    def _layout_probe_done(self, account: AccountPane, result: dict[str, Any]) -> None:
+        self.probe_layout_button.setEnabled(True)
+        if not result.get("ok"):
+            error = result.get("error") or "未知错误"
+            self.log(f"账号 {account.account_id} 布局探测失败：{error}")
+            QMessageBox.warning(self, "布局探测失败", str(error))
+            return
+
+        probe_dir = self.runtime_dir() / "layout_probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = probe_dir / f"account_{account.account_id}_{timestamp}.json"
+        data = {
+            "account_id": account.account_id,
+            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "probe": result,
+        }
+        output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.log(f"账号 {account.account_id} 布局探测已写入：{output_path}")
 
     def load_tasks(self) -> None:
         if self.task_load_thread is not None:

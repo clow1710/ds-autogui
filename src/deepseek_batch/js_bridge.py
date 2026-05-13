@@ -6,11 +6,12 @@ from typing import Any
 
 AUTOMATION_JS = r"""
 (function () {
-  if (window.__deepseekBatchBot) {
+  const BOT_VERSION = "2026-05-13-layout-probe-1";
+  if (window.__deepseekBatchBot && window.__deepseekBatchBot.version === BOT_VERSION) {
     return;
   }
 
-  const bot = {};
+  const bot = { version: BOT_VERSION };
 
   function textOf(el) {
     if (!el) return "";
@@ -281,10 +282,105 @@ AUTOMATION_JS = r"""
   }
 
   function cleanReply(value) {
-    return String(value || "")
-      .replace(/\n\s*(复制|Copy|重新生成|Regenerate)\s*$/gi, "")
+    const text = String(value || "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+    const jsonPayload = extractJsonPayload(text);
+    if (jsonPayload !== null) return jsonPayload;
+    return stripCodeFence(text)
+      .replace(/^(json|JSON)\s*\n(复制|Copy)\s*\n(下载|Download)\s*\n+/, "")
+      .replace(/\n\s*(复制|Copy|下载|Download|重新生成|Regenerate)\s*$/gi, "")
+      .trim();
+  }
+
+  function stripCodeFence(value) {
+    const text = String(value || "").trim();
+    const match = text.match(/^```(?:json|JSON)?\s*\n([\s\S]*?)\n```$/);
+    return match ? match[1].trim() : text;
+  }
+
+  function parsesJson(value) {
+    try {
+      JSON.parse(value);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function extractJsonPayload(value) {
+    const text = stripCodeFence(value);
+    if (!text) return null;
+    if (parsesJson(text)) return text;
+
+    for (let start = 0; start < text.length; start += 1) {
+      const first = text[start];
+      if (first !== "{" && first !== "[") continue;
+
+      const stack = [];
+      let inString = false;
+      let escaped = false;
+      for (let pos = start; pos < text.length; pos += 1) {
+        const ch = text[pos];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (ch === "\\") {
+            escaped = true;
+          } else if (ch === "\"") {
+            inString = false;
+          }
+          continue;
+        }
+
+        if (ch === "\"") {
+          inString = true;
+          continue;
+        }
+        if (ch === "{") {
+          stack.push("}");
+          continue;
+        }
+        if (ch === "[") {
+          stack.push("]");
+          continue;
+        }
+        if (ch === "}" || ch === "]") {
+          if (!stack.length || stack[stack.length - 1] !== ch) break;
+          stack.pop();
+          if (!stack.length) {
+            const candidate = text.slice(start, pos + 1).trim();
+            if (parsesJson(candidate)) return candidate;
+            break;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function elementText(el) {
+    return String((el && (el.innerText || el.textContent)) || "").trim();
+  }
+
+  function latestCodeBlockText(el) {
+    if (!el || !el.querySelectorAll) return "";
+    const blocks = Array.from(el.querySelectorAll("pre code, pre"))
+      .filter((node) => visible(node))
+      .map((node) => elementText(node))
+      .filter(Boolean);
+    return blocks.length ? blocks[blocks.length - 1] : "";
+  }
+
+  function readableReplyText(el) {
+    const codeText = latestCodeBlockText(el);
+    if (codeText) return codeText;
+
+    const clone = el.cloneNode(true);
+    for (const node of Array.from(clone.querySelectorAll("button,[role='button'],.ds-icon-button"))) {
+      node.remove();
+    }
+    return elementText(clone);
   }
 
   function looksLikePrompt(text, prompt) {
@@ -301,7 +397,7 @@ AUTOMATION_JS = r"""
       for (const el of Array.from(document.querySelectorAll(selector))) {
         if (seen.has(el) || !visible(el)) continue;
         seen.add(el);
-        const text = cleanReply(textOf(el));
+        const text = cleanReply(readableReplyText(el));
         if (text.length < 2 || looksLikePrompt(text, prompt)) continue;
         const rect = el.getBoundingClientRect();
         candidates.push({ text, top: rect.top, length: text.length, order });
@@ -313,26 +409,10 @@ AUTOMATION_JS = r"""
   }
 
   function collectCandidates(prompt) {
-    const deepseekMain = collectFromSelectors([
-      ".ds-markdown.ds-assistant-message-main-content"
-    ], prompt);
-    if (deepseekMain.length) return deepseekMain;
-
-    const primary = collectFromSelectors([
+    return collectFromSelectors([
+      ".ds-markdown.ds-assistant-message-main-content",
       "[data-message-author-role='assistant'] .ds-markdown",
       "[data-role='assistant'] .ds-markdown"
-    ], prompt);
-    if (primary.length) return primary;
-
-    return collectFromSelectors([
-      "[data-message-author-role='assistant']",
-      "[data-role='assistant']",
-      "[class*='assistant']",
-      "[class*='bot']",
-      ".ds-markdown",
-      "[class*='markdown']",
-      "main article",
-      "article"
     ], prompt);
   }
 
@@ -351,6 +431,244 @@ AUTOMATION_JS = r"""
     }
     return false;
   }
+
+  function textSummary(value, limit) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    const max = limit || 360;
+    if (text.length <= max) {
+      return { length: text.length, sample: text };
+    }
+    const edge = Math.max(80, Math.floor(max / 2));
+    return {
+      length: text.length,
+      sample: text.slice(0, edge) + " ... " + text.slice(-edge)
+    };
+  }
+
+  function rectInfo(el) {
+    if (!el || !el.getBoundingClientRect) return null;
+    const rect = el.getBoundingClientRect();
+    return {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      top: Math.round(rect.top),
+      left: Math.round(rect.left)
+    };
+  }
+
+  function attrsOf(el) {
+    const names = [
+      "id",
+      "class",
+      "role",
+      "aria-label",
+      "aria-pressed",
+      "aria-checked",
+      "aria-selected",
+      "aria-expanded",
+      "aria-disabled",
+      "title",
+      "name",
+      "type",
+      "placeholder",
+      "data-testid",
+      "data-role",
+      "data-message-author-role",
+      "data-model-type",
+      "data-state"
+    ];
+    const attrs = {};
+    for (const name of names) {
+      const value = el.getAttribute && el.getAttribute(name);
+      if (value !== null && value !== undefined && value !== "") attrs[name] = value;
+    }
+    if (el.attributes) {
+      for (const attr of Array.from(el.attributes)) {
+        if (attr.name.startsWith("data-") && attrs[attr.name] === undefined) {
+          attrs[attr.name] = attr.value;
+        }
+      }
+    }
+    return attrs;
+  }
+
+  function selectorPart(el) {
+    const tag = String(el.tagName || "node").toLowerCase();
+    const classes = String(el.className || "")
+      .split(/\s+/)
+      .filter((item) => /^[A-Za-z0-9_-]+$/.test(item))
+      .slice(0, 3)
+      .map((item) => "." + item)
+      .join("");
+
+    let nth = 1;
+    let cur = el;
+    while ((cur = cur.previousElementSibling)) {
+      if (cur.tagName === el.tagName) nth += 1;
+    }
+    return tag + classes + ":nth-of-type(" + nth + ")";
+  }
+
+  function cssPath(el) {
+    if (!el || !el.tagName) return "";
+    const parts = [];
+    let cur = el;
+    for (let depth = 0; cur && cur.nodeType === 1 && depth < 8; depth += 1) {
+      parts.unshift(selectorPart(cur));
+      if (cur === document.body || cur === document.documentElement) break;
+      cur = cur.parentElement;
+    }
+    return parts.join(" > ");
+  }
+
+  function ancestorChain(el, limit) {
+    const chain = [];
+    let cur = el ? el.parentElement : null;
+    while (cur && chain.length < (limit || 6)) {
+      chain.push({
+        tag: String(cur.tagName || "").toLowerCase(),
+        selector: cssPath(cur),
+        attrs: attrsOf(cur),
+        rect: rectInfo(cur),
+        text: textSummary(elementText(cur), 220)
+      });
+      cur = cur.parentElement;
+    }
+    return chain;
+  }
+
+  function elementProbe(el, textLimit) {
+    const label = controlLabel(el);
+    return {
+      tag: String((el && el.tagName) || "").toLowerCase(),
+      selector: cssPath(el),
+      attrs: attrsOf(el),
+      visible: visible(el),
+      enabled: enabled(el),
+      rect: rectInfo(el),
+      label: label.length > 300 ? label.slice(0, 300) + "..." : label,
+      text: textSummary(elementText(el), textLimit || 360),
+      ancestors: ancestorChain(el, 5)
+    };
+  }
+
+  function shallowTree(el, depth, maxDepth) {
+    if (!el || depth > maxDepth) return null;
+    const children = Array.from(el.children || []).slice(0, 12);
+    return {
+      tag: String(el.tagName || "").toLowerCase(),
+      attrs: attrsOf(el),
+      rect: rectInfo(el),
+      text: textSummary(elementText(el), 180),
+      children: children.map((child) => shallowTree(child, depth + 1, maxDepth)).filter(Boolean)
+    };
+  }
+
+  function nearestShell(el) {
+    let cur = el;
+    for (let i = 0; i < 7 && cur; i += 1) {
+      const hasMarkdown = cur.querySelector && cur.querySelector(".ds-markdown,[data-message-author-role='assistant'],[data-role='assistant']");
+      const hasControls = cur.querySelector && cur.querySelector("button,[role='button']");
+      if (hasMarkdown && hasControls) return cur;
+      cur = cur.parentElement;
+    }
+    return el ? el.parentElement : null;
+  }
+
+  function queryCount(selector) {
+    try {
+      return document.querySelectorAll(selector).length;
+    } catch (err) {
+      return -1;
+    }
+  }
+
+  function collectElements(selector, limit, textLimit) {
+    return Array.from(document.querySelectorAll(selector))
+      .slice(0, limit || 40)
+      .map((el) => elementProbe(el, textLimit));
+  }
+
+  function probeAssistantMarkdown(el) {
+    const shell = nearestShell(el);
+    return {
+      node: elementProbe(el, 520),
+      shell: shell ? elementProbe(shell, 520) : null,
+      shellTree: shell ? shallowTree(shell, 0, 2) : null,
+      codeBlocks: Array.from(el.querySelectorAll("pre code, pre, code"))
+        .slice(0, 20)
+        .map((node) => elementProbe(node, 520)),
+      shellControls: shell
+        ? Array.from(shell.querySelectorAll("button,[role='button']"))
+            .slice(0, 40)
+            .map((node) => elementProbe(node, 220))
+        : []
+    };
+  }
+
+  bot.probeLayout = function () {
+    try {
+      const selectorCounts = [
+        ".ds-markdown.ds-assistant-message-main-content",
+        "[data-message-author-role='assistant']",
+        "[data-message-author-role='assistant'] .ds-markdown",
+        "[data-role='assistant']",
+        "[data-role='assistant'] .ds-markdown",
+        "[role='radiogroup'] [role='radio'][data-model-type]",
+        "textarea",
+        "[contenteditable='true']",
+        "[role='textbox']",
+        "button",
+        "[role='button']",
+        "pre",
+        "pre code",
+        "code",
+        "details",
+        "[class*='think']",
+        "[class*='reason']",
+        "[class*='search']"
+      ].map((selector) => ({ selector, count: queryCount(selector) }));
+
+      const assistantNodes = Array.from(document.querySelectorAll(
+        ".ds-markdown.ds-assistant-message-main-content," +
+        "[data-message-author-role='assistant'] .ds-markdown," +
+        "[data-role='assistant'] .ds-markdown"
+      )).slice(-5);
+
+      return {
+        ok: true,
+        botVersion: BOT_VERSION,
+        generatedAt: new Date().toISOString(),
+        url: window.location.href,
+        title: document.title,
+        viewport: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio
+        },
+        body: document.body ? elementProbe(document.body, 220) : null,
+        selectorCounts,
+        chatModeRadios: collectElements("[role='radiogroup'] [role='radio'][data-model-type]", 20, 180),
+        composerCandidates: collectElements(
+          "textarea,[contenteditable='true'],[role='textbox'],div.ProseMirror,input[type='text']",
+          30,
+          220
+        ),
+        controls: collectElements(
+          "button,[role='button'],[role='menuitem'],[role='option'],[role='radio'],[role='tab'],label",
+          140,
+          220
+        ),
+        assistantMarkdowns: assistantNodes.map((el) => probeAssistantMarkdown(el)),
+        codeBlocks: collectElements("pre code, pre, code", 80, 520),
+        detailsBlocks: collectElements("details,summary", 40, 360)
+      };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message ? err.message : err) };
+    }
+  };
 
   bot.newChat = function (options) {
     try {
