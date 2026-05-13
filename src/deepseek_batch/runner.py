@@ -34,12 +34,25 @@ class AccountRunner(QObject):
         self.success_count = 0
         self.failure_count = 0
         self.total_success_seconds = 0.0
+        self.pending_hook_output_path: Path | None = None
+        self.next_action_deadline_monotonic = 0.0
 
     @property
     def avg_success_seconds(self) -> float:
         if self.success_count == 0:
             return 0.0
         return self.total_success_seconds / self.success_count
+
+    @property
+    def remaining_wait_seconds(self) -> float:
+        if not self.running or self.current_task is not None:
+            return 0.0
+        remaining = self.next_action_deadline_monotonic - time.monotonic()
+        return max(0.0, remaining)
+
+    def _schedule_next_task(self, delay_ms: int) -> None:
+        self.next_action_deadline_monotonic = time.monotonic() + delay_ms / 1000
+        QTimer.singleShot(delay_ms, self._take_next_task)
 
     def _record_assigned(self) -> None:
         self.assigned_count += 1
@@ -60,13 +73,15 @@ class AccountRunner(QObject):
     def start_after(self, delay_ms: int) -> None:
         self.running = True
         self.status_changed.emit(self.account.account_id, f"{delay_ms / 1000:.1f}s 后启动")
-        QTimer.singleShot(delay_ms, self._take_next_task)
+        self._schedule_next_task(delay_ms)
 
     def stop(self) -> None:
         self.running = False
+        self.next_action_deadline_monotonic = 0.0
         self.status_changed.emit(self.account.account_id, "已停止")
 
     def _take_next_task(self) -> None:
+        self.next_action_deadline_monotonic = 0.0
         if not self.running:
             return
 
@@ -208,6 +223,30 @@ class AccountRunner(QObject):
 
         task = self.current_task
         now = time.monotonic()
+
+        if result.get("ok") and result.get("serverBusy"):
+            cooldown_ms = self.window.busy_cooldown_ms()
+            self.window.requeue_task(task)
+            self.window.mark_task(
+                task.task_id,
+                f"服务器繁忙，{cooldown_ms / 1000:.0f}s 后重试",
+                self.account.account_id,
+            )
+            self.window.log(
+                f"账号 {self.account.account_id} 收到服务器繁忙提示，"
+                f"任务 {task.task_id} 重排，{cooldown_ms / 1000:.0f}s 后继续。"
+            )
+            self.current_task = None
+            self.task_start_monotonic = 0.0
+            self.last_content = ""
+            self.poll_started_monotonic = 0.0
+            self.status_changed.emit(
+                self.account.account_id,
+                f"服务器繁忙 {cooldown_ms / 1000:.0f}s 冷却",
+            )
+            self._schedule_next_task(cooldown_ms)
+            return
+
         timeout = self.window.reply_timeout_spin.value()
         if now - self.poll_started_monotonic > timeout:
             self.running = False
@@ -263,11 +302,12 @@ class AccountRunner(QObject):
         if self.window.check_hook_enabled():
             self.window.mark_task(task.task_id, "校验中", self.account.account_id)
             self.status_changed.emit(self.account.account_id, f"任务 {task.task_id} 校验中")
+            self.pending_hook_output_path = result.output_path
             self.window.run_check_hook_async(
                 task,
                 result.output_path,
-                lambda check_result, t=task, p=result.output_path: self._after_check_hook(t, p, check_result),
-                lambda task_id, error, t=task, p=result.output_path: self._after_check_hook_error(t, p, error),
+                self._after_check_hook,
+                self._after_check_hook_error,
             )
             return
 
@@ -276,14 +316,12 @@ class AccountRunner(QObject):
         self._record_success()
         self._continue_after_task()
 
-    def _after_check_hook(
-        self,
-        task: PromptTask,
-        output_path: Path,
-        result: CheckHookResult,
-    ) -> None:
-        if self.current_task is None or self.current_task.task_id != task.task_id:
+    def _after_check_hook(self, result: CheckHookResult) -> None:
+        task = self.current_task
+        output_path = self.pending_hook_output_path
+        if task is None or output_path is None or task.task_id != result.task_id:
             return
+        self.pending_hook_output_path = None
 
         if result.passed:
             self.window.mark_task(task.task_id, "完成（校验通过）", self.account.account_id)
@@ -298,14 +336,12 @@ class AccountRunner(QObject):
         reason = stderr_tail or stdout_tail or f"退出码 {result.returncode}"
         self._handle_check_failure(task, output_path, reason)
 
-    def _after_check_hook_error(
-        self,
-        task: PromptTask,
-        output_path: Path,
-        error: str,
-    ) -> None:
-        if self.current_task is None or self.current_task.task_id != task.task_id:
+    def _after_check_hook_error(self, task_id: str, error: str) -> None:
+        task = self.current_task
+        output_path = self.pending_hook_output_path
+        if task is None or output_path is None or task.task_id != task_id:
             return
+        self.pending_hook_output_path = None
         self._handle_check_failure(task, output_path, f"检查脚本异常：{error}")
 
     def _handle_check_failure(self, task: PromptTask, output_path: Path, reason: str) -> None:
@@ -349,7 +385,7 @@ class AccountRunner(QObject):
             return
         delay_ms = self.window.random_delay_ms()
         self.status_changed.emit(self.account.account_id, f"{delay_ms / 1000:.1f}s 后继续")
-        QTimer.singleShot(delay_ms, self._take_next_task)
+        self._schedule_next_task(delay_ms)
 
     def _after_result_write_failed(self, task_id: str, error: str) -> None:
         self.running = False

@@ -81,6 +81,11 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self.rebuild_accounts()
 
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(1000)
+        self._stats_timer.timeout.connect(self._refresh_stats_table)
+        self._stats_timer.start()
+
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -138,6 +143,10 @@ class MainWindow(QMainWindow):
         self.reply_timeout_spin.setRange(30, 7200)
         self.reply_timeout_spin.setValue(900)
         self.reply_timeout_spin.setSuffix(" 秒")
+        self.busy_cooldown_spin = QSpinBox(self)
+        self.busy_cooldown_spin.setRange(10, 3600)
+        self.busy_cooldown_spin.setValue(120)
+        self.busy_cooldown_spin.setSuffix(" 秒")
 
         self.chat_mode_combo = QComboBox(self)
         self.chat_mode_combo.addItem("专家模式", "expert")
@@ -165,6 +174,7 @@ class MainWindow(QMainWindow):
             self.poll_interval_spin,
             self.stable_seconds_spin,
             self.reply_timeout_spin,
+            self.busy_cooldown_spin,
             self.check_hook_max_retries_spin,
         ):
             spin.setMaximumWidth(spin_max_width)
@@ -206,6 +216,7 @@ class MainWindow(QMainWindow):
             ("轮询间隔", self.poll_interval_spin),
             ("回复稳定", self.stable_seconds_spin),
             ("回复超时", self.reply_timeout_spin),
+            ("繁忙冷却", self.busy_cooldown_spin),
             ("重试上限", self.check_hook_max_retries_spin),
         ]
         for index, (text, widget) in enumerate(settings_pairs):
@@ -242,22 +253,26 @@ class MainWindow(QMainWindow):
 
         self.task_table = QTableWidget(0, 4, self)
         self.task_table.setHorizontalHeaderLabels(["任务 ID", "状态", "账号", "Prompt 文件"])
-        self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.task_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.task_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.task_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.task_table.setWordWrap(False)
+        task_header = self.task_table.horizontalHeader()
+        task_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        task_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        task_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        task_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.task_table.setColumnWidth(1, 160)
 
-        self.stats_table = QTableWidget(0, 5, self)
-        self.stats_table.setHorizontalHeaderLabels(["账号", "已分配", "成功", "失败", "平均耗时"])
+        self.stats_table = QTableWidget(0, 6, self)
+        self.stats_table.setHorizontalHeaderLabels(["账号", "已分配", "成功", "失败", "平均耗时", "等待"])
         self.stats_table.verticalHeader().setVisible(False)
         self.stats_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.stats_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.stats_table.setMinimumWidth(0)
         self.stats_table.horizontalHeader().setMinimumSectionSize(30)
-        for col in range(5):
+        for col in range(6):
             mode = (
                 QHeaderView.ResizeMode.Stretch
-                if col == 4
+                if col == 5
                 else QHeaderView.ResizeMode.ResizeToContents
             )
             self.stats_table.horizontalHeader().setSectionResizeMode(col, mode)
@@ -339,6 +354,7 @@ class MainWindow(QMainWindow):
         self.poll_interval_spin.setValue(int(self.settings.value("poll_interval", 2)))
         self.stable_seconds_spin.setValue(int(self.settings.value("stable_seconds", 8)))
         self.reply_timeout_spin.setValue(int(self.settings.value("reply_timeout", 900)))
+        self.busy_cooldown_spin.setValue(int(self.settings.value("busy_cooldown", 120)))
         chat_mode = str(self.settings.value("chat_mode", "expert"))
         chat_mode_index = self.chat_mode_combo.findData(chat_mode)
         if chat_mode_index < 0:
@@ -373,6 +389,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("poll_interval", self.poll_interval_spin.value())
         self.settings.setValue("stable_seconds", self.stable_seconds_spin.value())
         self.settings.setValue("reply_timeout", self.reply_timeout_spin.value())
+        self.settings.setValue("busy_cooldown", self.busy_cooldown_spin.value())
         self.settings.setValue("chat_mode", self.chat_mode_combo.currentData() or "expert")
         self.settings.setValue("search_enabled", self.search_check.isChecked())
         self.settings.setValue("require_search", self.require_search_check.isChecked())
@@ -460,6 +477,9 @@ class MainWindow(QMainWindow):
         low = self.min_delay_spin.value()
         high = self.max_delay_spin.value()
         return int(random.uniform(low, high) * 1000)
+
+    def busy_cooldown_ms(self) -> int:
+        return int(self.busy_cooldown_spin.value()) * 1000
 
     def rebuild_accounts(self) -> None:
         if any(runner.running for runner in self.runners):
@@ -609,6 +629,7 @@ class MainWindow(QMainWindow):
         account_item = self.task_table.item(row, 2)
         if status_item is not None:
             status_item.setText(status)
+            status_item.setToolTip(status)
         if account_item is not None:
             account_item.setText(str(account_id))
 
@@ -737,7 +758,7 @@ class MainWindow(QMainWindow):
     def _runner_status_changed(self, account_id: int, status: str) -> None:
         index = account_id - 1
         if 0 <= index < self.account_tabs.count():
-            self.account_tabs.setTabText(index, f"账号 {account_id} - {status}")
+            self.account_tabs.setTabToolTip(index, f"账号 {account_id} - {status}")
 
     def _runner_stats_updated(self, account_id: int) -> None:
         for row, runner in enumerate(self.runners):
@@ -757,6 +778,7 @@ class MainWindow(QMainWindow):
             str(runner.success_count),
             str(runner.failure_count),
             self._format_duration(runner.avg_success_seconds),
+            self._format_duration(runner.remaining_wait_seconds),
         ]
         for col, text in enumerate(values):
             item = self.stats_table.item(row, col)
@@ -771,12 +793,15 @@ class MainWindow(QMainWindow):
     def _format_duration(seconds: float) -> str:
         if seconds <= 0:
             return "-"
-        if seconds < 60:
-            return f"{seconds:.1f} 秒"
-        minutes = seconds / 60
-        if minutes < 60:
-            return f"{minutes:.1f} 分"
-        return f"{minutes / 60:.1f} 时"
+        total = int(round(seconds))
+        if total < 60:
+            return f"{total}秒"
+        if total < 3600:
+            minutes, secs = divmod(total, 60)
+            return f"{minutes}分" if secs == 0 else f"{minutes}分{secs}秒"
+        hours, rem = divmod(total, 3600)
+        minutes = rem // 60
+        return f"{hours}时" if minutes == 0 else f"{hours}时{minutes}分"
 
     def closeEvent(self, event: Any) -> None:
         self._save_settings()

@@ -6,7 +6,7 @@ from typing import Any
 
 AUTOMATION_JS = r"""
 (function () {
-  const BOT_VERSION = "2026-05-13-new-chat-fix-1";
+  const BOT_VERSION = "2026-05-14-busy-detect-1";
   if (window.__deepseekBatchBot && window.__deepseekBatchBot.version === BOT_VERSION) {
     return;
   }
@@ -469,6 +469,20 @@ AUTOMATION_JS = r"""
     ], prompt);
   }
 
+  function isServerBusy() {
+    const phrases = ["服务器繁忙", "Server busy"];
+    const all = document.querySelectorAll("body *");
+    for (const el of all) {
+      if (!visible(el)) continue;
+      const own = norm(el.innerText || el.textContent || "");
+      if (!own || own.length > 80) continue;
+      for (const phrase of phrases) {
+        if (own.includes(phrase)) return true;
+      }
+    }
+    return false;
+  }
+
   function isGenerating() {
     const terms = ["停止生成", "停止回答", "Stop generating", "Stop responding", "Generating"];
     const lowered = terms.map((term) => term.toLowerCase());
@@ -802,6 +816,7 @@ AUTOMATION_JS = r"""
         content: latest,
         length: latest.length,
         generating: isGenerating(),
+        serverBusy: isServerBusy(),
         candidateCount: candidates.length
       };
     } catch (err) {
