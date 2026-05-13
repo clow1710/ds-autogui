@@ -6,7 +6,7 @@ from typing import Any
 
 AUTOMATION_JS = r"""
 (function () {
-  const BOT_VERSION = "2026-05-13-layout-probe-1";
+  const BOT_VERSION = "2026-05-13-new-chat-fix-1";
   if (window.__deepseekBatchBot && window.__deepseekBatchBot.version === BOT_VERSION) {
     return;
   }
@@ -272,8 +272,57 @@ AUTOMATION_JS = r"""
     return findComposerActionButton(composer, true);
   }
 
+  function isAlreadyNewChat() {
+    const assistantSelectors = [
+      ".ds-markdown.ds-assistant-message-main-content",
+      "[data-message-author-role='assistant'] .ds-markdown",
+      "[data-role='assistant'] .ds-markdown"
+    ].join(",");
+    return document.querySelectorAll(assistantSelectors).length === 0;
+  }
+
+  function findButtonByLooseLabel(terms) {
+    const labels = terms.map((term) => norm(term).toLowerCase()).filter(Boolean);
+    if (!labels.length) return null;
+    const controls = Array.from(document.querySelectorAll(
+      "button,[role='button'],[role='menuitem'],[role='option'],[role='radio'],[role='tab'],a"
+    ));
+    for (const el of controls) {
+      if (!visible(el) || !enabled(el)) continue;
+      const label = controlLabel(el).toLowerCase();
+      if (label && labels.some((term) => label.includes(term))) return el;
+    }
+    return null;
+  }
+
+  function findButtonNearLabelText(terms) {
+    const labels = terms.map((term) => norm(term).toLowerCase()).filter(Boolean);
+    if (!labels.length) return null;
+    const all = Array.from(document.querySelectorAll("body *"));
+    for (const el of all) {
+      const own = norm(el.innerText || el.textContent || "").toLowerCase();
+      if (!own || !labels.some((term) => own === term)) continue;
+      let cur = el;
+      for (let depth = 0; depth < 4 && cur; depth += 1) {
+        if (cur.tagName === "BUTTON" || (cur.getAttribute && cur.getAttribute("role") === "button")) {
+          if (visible(cur) && enabled(cur)) return cur;
+        }
+        cur = cur.parentElement;
+      }
+      const sibling = el.parentElement && el.parentElement.querySelector("button,[role='button']");
+      if (sibling && visible(sibling) && enabled(sibling)) return sibling;
+    }
+    return null;
+  }
+
   function clickNewChat(terms) {
-    const button = findButtonByTerms(terms || []);
+    const termList = terms || [];
+    if (isAlreadyNewChat()) {
+      return { ok: true, label: "(already-new-chat)", skipped: true };
+    }
+    let button = findButtonByTerms(termList);
+    if (!button) button = findButtonByLooseLabel(termList);
+    if (!button) button = findButtonNearLabelText(termList);
     if (!button) {
       return { ok: false, warning: "未找到新对话按钮" };
     }
@@ -308,55 +357,51 @@ AUTOMATION_JS = r"""
     }
   }
 
+  function findFirstBalanced(text, start) {
+    const stack = [];
+    let inString = false;
+    let escaped = false;
+    for (let pos = start; pos < text.length; pos += 1) {
+      const ch = text[pos];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === "\"") { inString = true; continue; }
+      if (ch === "{") { stack.push("}"); continue; }
+      if (ch === "[") { stack.push("]"); continue; }
+      if (ch === "}" || ch === "]") {
+        if (!stack.length || stack[stack.length - 1] !== ch) return -1;
+        stack.pop();
+        if (!stack.length) return pos + 1;
+      }
+    }
+    return -1;
+  }
+
   function extractJsonPayload(value) {
     const text = stripCodeFence(value);
     if (!text) return null;
     if (parsesJson(text)) return text;
 
+    let best = null;
     for (let start = 0; start < text.length; start += 1) {
       const first = text[start];
       if (first !== "{" && first !== "[") continue;
-
-      const stack = [];
-      let inString = false;
-      let escaped = false;
-      for (let pos = start; pos < text.length; pos += 1) {
-        const ch = text[pos];
-        if (inString) {
-          if (escaped) {
-            escaped = false;
-          } else if (ch === "\\") {
-            escaped = true;
-          } else if (ch === "\"") {
-            inString = false;
-          }
-          continue;
-        }
-
-        if (ch === "\"") {
-          inString = true;
-          continue;
-        }
-        if (ch === "{") {
-          stack.push("}");
-          continue;
-        }
-        if (ch === "[") {
-          stack.push("]");
-          continue;
-        }
-        if (ch === "}" || ch === "]") {
-          if (!stack.length || stack[stack.length - 1] !== ch) break;
-          stack.pop();
-          if (!stack.length) {
-            const candidate = text.slice(start, pos + 1).trim();
-            if (parsesJson(candidate)) return candidate;
-            break;
-          }
-        }
+      const end = findFirstBalanced(text, start);
+      if (end <= start) continue;
+      const candidate = text.slice(start, end).trim();
+      if (parsesJson(candidate)) {
+        if (!best || candidate.length > best.length) best = candidate;
       }
     }
-    return null;
+    return best;
   }
 
   function elementText(el) {
@@ -369,7 +414,15 @@ AUTOMATION_JS = r"""
       .filter((node) => visible(node))
       .map((node) => elementText(node))
       .filter(Boolean);
-    return blocks.length ? blocks[blocks.length - 1] : "";
+    if (!blocks.length) return "";
+    for (let i = blocks.length - 1; i >= 0; i -= 1) {
+      const stripped = blocks[i].trim();
+      if (stripped.startsWith("{") || stripped.startsWith("[")) return blocks[i];
+    }
+    const isJustLanguageLabel = (text) => /^(json|JSON|javascript|js|ts|typescript|html|css|python|bash|sh|yaml|yml|xml|sql|md|markdown|java|go|rust|c|c\+\+|cpp)$/i.test(text.trim());
+    const meaningful = blocks.filter((text) => !isJustLanguageLabel(text));
+    if (meaningful.length) return meaningful[meaningful.length - 1];
+    return blocks[blocks.length - 1];
   }
 
   function readableReplyText(el) {

@@ -13,5 +13,6 @@ wheels/
 runtime/
 outputs/
 tmp/
+tasks/
 prompts/*.prompt
 !prompts/.gitkeep
