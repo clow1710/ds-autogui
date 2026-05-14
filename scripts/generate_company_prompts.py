@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 from pathlib import Path
 from typing import Iterable
 
@@ -13,7 +12,7 @@ DEFAULT_TEMPLATE = PROJECT_ROOT / "prompt_templates" / "company_registry_lookup.
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "prompts"
 
 REQUIRED_COLUMNS = ("id", "name")
-REQUIRED_PLACEHOLDERS = ("{{BATCH_ID}}", "{{COMPANIES_JSON}}")
+REQUIRED_PLACEHOLDERS = ("{{BATCH_ID}}", "{{COMPANIES_LIST}}", "{{COMPANY_COUNT}}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=10,
-        help="Number of companies per prompt file. Default: 10",
+        default=50,
+        help="Number of companies per prompt file. Default: 50",
     )
     parser.add_argument(
         "--prefix",
@@ -126,16 +125,23 @@ def load_template(template_path: Path) -> str:
     return template
 
 
+def render_companies_list(companies: list[dict[str, str]]) -> str:
+    lines = []
+    for index, company in enumerate(companies, start=1):
+        lines.append(f"{index}. [{company['id']}] {company['name']}")
+    return "\n".join(lines)
+
+
 def render_prompt(
     template: str,
     *,
     batch_id: str,
     companies: list[dict[str, str]],
 ) -> str:
-    companies_json = json.dumps(companies, ensure_ascii=False, indent=2)
     replacements = {
         "{{BATCH_ID}}": batch_id,
-        "{{COMPANIES_JSON}}": companies_json,
+        "{{COMPANIES_LIST}}": render_companies_list(companies),
+        "{{COMPANY_COUNT}}": str(len(companies)),
     }
 
     rendered = template

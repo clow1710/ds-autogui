@@ -33,13 +33,22 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
 
+_COMPANY_LINE_RE = re.compile(r"^\s*\d+\.\s*\[([^\]]+)\]\s*(.+?)\s*$")
+
+
 def _extract_companies_from_prompt(prompt_text: str) -> list[dict[str, str]]:
-    match = re.search(r"```json\s*(.*?)```", prompt_text, re.DOTALL)
-    if not match:
-        raise ValueError("prompt 中未找到 ```json ... ``` 代码块")
-    companies = json.loads(match.group(1).strip())
-    if not isinstance(companies, list):
-        raise ValueError("prompt 公司列表不是数组")
+    companies: list[dict[str, str]] = []
+    for line in prompt_text.splitlines():
+        match = _COMPANY_LINE_RE.match(line)
+        if not match:
+            continue
+        cid = match.group(1).strip()
+        name = match.group(2).strip()
+        if not cid or not name:
+            continue
+        companies.append({"id": cid, "name": name})
+    if not companies:
+        raise ValueError("prompt 中未找到形如 `序号. [id] 公司名称` 的列表")
     return companies
 
 
