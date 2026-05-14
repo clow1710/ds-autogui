@@ -38,6 +38,7 @@ class AccountRunner(QObject):
         self.next_action_deadline_monotonic = 0.0
         self.baseline_bubble_count: int | None = None
         self._approaching_timeout_focused = False
+        self.busy_rounds = 0
 
     @property
     def avg_success_seconds(self) -> float:
@@ -62,6 +63,31 @@ class AccountRunner(QObject):
         self.next_action_deadline_monotonic = time.monotonic() + delay_ms / 1000
         QTimer.singleShot(delay_ms, self._take_next_task)
 
+    def _handle_busy_round(self, task: PromptTask, reason: str) -> None:
+        # 繁忙重试期间不暂停账号：把任务塞回队首，进入新一轮冷却等待。
+        self.busy_rounds += 1
+        cooldown_ms = self.window.busy_cooldown_ms()
+        round_label = f"第{self.busy_rounds}轮"
+        self.window.requeue_task(task, self.account.account_id)
+        self.window.mark_task(
+            task.task_id,
+            f"{reason}（{round_label}），{cooldown_ms / 1000:.0f}s 后重试",
+            self.account.account_id,
+        )
+        self.window.log(
+            f"账号 {self.account.account_id} 任务 {task.task_id} {reason}，"
+            f"{round_label}繁忙等待 {cooldown_ms / 1000:.0f}s 后重试。"
+        )
+        self.current_task = None
+        self.task_start_monotonic = 0.0
+        self.last_content = ""
+        self.poll_started_monotonic = 0.0
+        self.status_changed.emit(
+            self.account.account_id,
+            f"服务器繁忙 {round_label} {cooldown_ms / 1000:.0f}s 冷却",
+        )
+        self._schedule_next_task(cooldown_ms)
+
     def _record_assigned(self) -> None:
         self.assigned_count += 1
         self.stats_updated.emit(self.account.account_id)
@@ -71,6 +97,7 @@ class AccountRunner(QObject):
             self.total_success_seconds += time.monotonic() - self.task_start_monotonic
         self.success_count += 1
         self.task_start_monotonic = 0.0
+        self.busy_rounds = 0
         self.stats_updated.emit(self.account.account_id)
 
     def _record_failure(self) -> None:
@@ -191,6 +218,9 @@ class AccountRunner(QObject):
             return
 
         error = result.get("error") or result.get("warning") or "对话模式切换失败"
+        if self.busy_rounds > 0:
+            self._handle_busy_round(task, f"繁忙重试中模式切换失败：{error}")
+            return
         self.running = False
         self._record_failure()
         self.window.requeue_task(task, self.account.account_id)
@@ -212,11 +242,15 @@ class AccountRunner(QObject):
             return
         task = self.current_task
         if not result.get("ok"):
+            send_error = result.get("error") or "发送失败"
+            if self.busy_rounds > 0:
+                self._handle_busy_round(task, f"繁忙重试中发送失败：{send_error}")
+                return
             self.running = False
             self._record_failure()
             self.window.requeue_task(task, self.account.account_id)
-            self.window.mark_task(task.task_id, f"已重排：{result.get('error')}", self.account.account_id)
-            self.window.log(f"账号 {self.account.account_id} 未发送任务 {task.task_id}，已重排：{result.get('error')}")
+            self.window.mark_task(task.task_id, f"已重排：{send_error}", self.account.account_id)
+            self.window.log(f"账号 {self.account.account_id} 未发送任务 {task.task_id}，已重排：{send_error}")
             self.status_changed.emit(self.account.account_id, "已暂停")
             self.current_task = None
             self.window.runner_idle(self)
@@ -249,26 +283,7 @@ class AccountRunner(QObject):
         now = time.monotonic()
 
         if result.get("ok") and result.get("serverBusy"):
-            cooldown_ms = self.window.busy_cooldown_ms()
-            self.window.requeue_task(task, self.account.account_id)
-            self.window.mark_task(
-                task.task_id,
-                f"服务器繁忙，{cooldown_ms / 1000:.0f}s 后重试",
-                self.account.account_id,
-            )
-            self.window.log(
-                f"账号 {self.account.account_id} 收到服务器繁忙提示，"
-                f"任务 {task.task_id} 重排，{cooldown_ms / 1000:.0f}s 后继续。"
-            )
-            self.current_task = None
-            self.task_start_monotonic = 0.0
-            self.last_content = ""
-            self.poll_started_monotonic = 0.0
-            self.status_changed.emit(
-                self.account.account_id,
-                f"服务器繁忙 {cooldown_ms / 1000:.0f}s 冷却",
-            )
-            self._schedule_next_task(cooldown_ms)
+            self._handle_busy_round(task, "服务器繁忙")
             return
 
         timeout = self.window.reply_timeout_spin.value()
@@ -303,6 +318,7 @@ class AccountRunner(QObject):
         if content and content != self.last_content:
             self.last_content = content
             self.last_change_monotonic = now
+            self.busy_rounds = 0
             self.window.mark_task(task.task_id, f"接收中 {len(content)} 字", self.account.account_id)
 
         stable_for = now - self.last_change_monotonic

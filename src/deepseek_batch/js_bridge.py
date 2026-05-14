@@ -6,7 +6,7 @@ from typing import Any
 
 AUTOMATION_JS = r"""
 (function () {
-  const BOT_VERSION = "2026-05-14-busy-detect-3";
+  const BOT_VERSION = "2026-05-14-auto-focus-1";
   if (window.__deepseekBatchBot && window.__deepseekBatchBot.version === BOT_VERSION) {
     return;
   }
@@ -532,12 +532,17 @@ AUTOMATION_JS = r"""
   }
 
   function hasFreshBusyMessage(baselineBubbleCount, currentBubbleCount, prompt) {
-    if (typeof baselineBubbleCount !== "number" || typeof currentBubbleCount !== "number") return false;
-    const delta = currentBubbleCount - baselineBubbleCount;
-    if (delta <= 0) return false;
     const bubbles = listVisibleBubbles();
     if (bubbles.length === 0) return false;
-    const fresh = bubbles.slice(-delta);
+    let inspectCount;
+    if (typeof baselineBubbleCount === "number" && typeof currentBubbleCount === "number") {
+      const delta = currentBubbleCount - baselineBubbleCount;
+      inspectCount = delta > 0 ? delta : 1;
+    } else {
+      inspectCount = 1;
+    }
+    inspectCount = Math.min(inspectCount, bubbles.length);
+    const fresh = bubbles.slice(-inspectCount);
     for (const el of fresh) {
       const text = norm(el.innerText || el.textContent || "");
       if (!text || text.length > 200) continue;
