@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
         self.hook_workers: list[CheckHookWorker] = []
         self.hook_retries: dict[str, int] = {}
         self.start_requested_after_load = False
+        self._max_started_row = -1
 
         self._build_ui()
         self._load_settings()
@@ -149,7 +150,7 @@ class MainWindow(QMainWindow):
         self.busy_cooldown_spin.setValue(120)
         self.busy_cooldown_spin.setSuffix(" 秒")
         self.startup_delay_spin = QSpinBox(self)
-        self.startup_delay_spin.setRange(0, 600)
+        self.startup_delay_spin.setRange(1, 600)
         self.startup_delay_spin.setValue(10)
         self.startup_delay_spin.setSuffix(" 秒")
 
@@ -271,17 +272,18 @@ class MainWindow(QMainWindow):
         task_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.task_table.setColumnWidth(1, 160)
 
-        self.stats_table = QTableWidget(0, 6, self)
-        self.stats_table.setHorizontalHeaderLabels(["账号", "已分配", "成功", "失败", "平均耗时", "等待"])
+        stats_columns = ["账号", "已分配", "成功", "失败", "平均耗时", "已等待", "冷却"]
+        self.stats_table = QTableWidget(0, len(stats_columns), self)
+        self.stats_table.setHorizontalHeaderLabels(stats_columns)
         self.stats_table.verticalHeader().setVisible(False)
         self.stats_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.stats_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.stats_table.setMinimumWidth(0)
         self.stats_table.horizontalHeader().setMinimumSectionSize(30)
-        for col in range(6):
+        for col in range(len(stats_columns)):
             mode = (
                 QHeaderView.ResizeMode.Stretch
-                if col == 5
+                if col == len(stats_columns) - 1
                 else QHeaderView.ResizeMode.ResizeToContents
             )
             self.stats_table.horizontalHeader().setSectionResizeMode(col, mode)
@@ -541,6 +543,13 @@ class MainWindow(QMainWindow):
             account.load_chat()
         self.log("已打开 DeepSeek 登录/聊天页面。")
 
+    def focus_account_tab(self, account_id: int) -> None:
+        for account in self.accounts:
+            if account.account_id == account_id:
+                if self.account_tabs.currentWidget() is not account:
+                    self.account_tabs.setCurrentWidget(account)
+                return
+
     def probe_current_layout(self) -> None:
         widget = self.account_tabs.currentWidget()
         if not isinstance(widget, AccountPane):
@@ -585,6 +594,7 @@ class MainWindow(QMainWindow):
         self.task_rows.clear()
         self.hook_retries.clear()
         self.task_table.setRowCount(0)
+        self._max_started_row = -1
         self.load_tasks_button.setEnabled(False)
         self.log("正在后台扫描 prompt 目录。")
 
@@ -648,6 +658,17 @@ class MainWindow(QMainWindow):
             status_item.setToolTip(status)
         if account_item is not None:
             account_item.setText(str(account_id))
+
+        # "已分配" 只是随机分配阶段的预先标签，不算"已开始"，跳过自动滚动。
+        if status == "已分配":
+            return
+        if row > self._max_started_row:
+            self._max_started_row = row
+        target = self.task_table.item(self._max_started_row, 1)
+        if target is not None:
+            self.task_table.scrollToItem(
+                target, QAbstractItemView.ScrollHint.PositionAtBottom
+            )
 
     def take_next_task(self, account_id: int | None = None) -> PromptTask | None:
         if self.account_task_queues:
@@ -766,19 +787,21 @@ class MainWindow(QMainWindow):
         if self.random_assign_check.isChecked() and self.runners:
             pending = list(self.tasks)
             random.shuffle(pending)
+            shuffled_runners = list(self.runners)
+            random.shuffle(shuffled_runners)
             queues: dict[int, Deque[PromptTask]] = {
                 runner.account.account_id: deque() for runner in self.runners
             }
-            assignment_order: list[int] = []
-            seen: set[int] = set()
-            for task in pending:
-                runner = random.choice(self.runners)
+            for index, task in enumerate(pending):
+                runner = shuffled_runners[index % len(shuffled_runners)]
                 account_id = runner.account.account_id
                 queues[account_id].append(task)
-                if account_id not in seen:
-                    seen.add(account_id)
-                    assignment_order.append(account_id)
                 self.mark_task(task.task_id, "已分配", account_id)
+            assignment_order = [
+                r.account.account_id
+                for r in shuffled_runners
+                if queues[r.account.account_id]
+            ]
             self.account_task_queues = queues
             self.tasks.clear()
 
@@ -802,8 +825,11 @@ class MainWindow(QMainWindow):
         if any(item.running for item in self.runners):
             return
         self._batch_finished()
-        if self.tasks:
-            self.log(f"批处理暂停，仍有 {len(self.tasks)} 个任务待处理。")
+        remaining = len(self.tasks) + sum(
+            len(q) for q in self.account_task_queues.values()
+        )
+        if remaining:
+            self.log(f"批处理暂停，仍有 {remaining} 个任务待处理。")
         else:
             self.log("批处理完成。")
 
@@ -836,6 +862,7 @@ class MainWindow(QMainWindow):
             str(runner.success_count),
             str(runner.failure_count),
             self._format_duration(runner.avg_success_seconds),
+            self._format_duration(runner.current_reply_wait_seconds),
             self._format_duration(runner.remaining_wait_seconds),
         ]
         for col, text in enumerate(values):

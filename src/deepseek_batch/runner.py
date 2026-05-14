@@ -37,6 +37,7 @@ class AccountRunner(QObject):
         self.pending_hook_output_path: Path | None = None
         self.next_action_deadline_monotonic = 0.0
         self.baseline_bubble_count: int | None = None
+        self._approaching_timeout_focused = False
 
     @property
     def avg_success_seconds(self) -> float:
@@ -50,6 +51,12 @@ class AccountRunner(QObject):
             return 0.0
         remaining = self.next_action_deadline_monotonic - time.monotonic()
         return max(0.0, remaining)
+
+    @property
+    def current_reply_wait_seconds(self) -> float:
+        if self.current_task is None or self.poll_started_monotonic <= 0:
+            return 0.0
+        return max(0.0, time.monotonic() - self.poll_started_monotonic)
 
     def _schedule_next_task(self, delay_ms: int) -> None:
         self.next_action_deadline_monotonic = time.monotonic() + delay_ms / 1000
@@ -103,6 +110,14 @@ class AccountRunner(QObject):
         self.window.mark_task(task.task_id, "准备发送", self.account.account_id)
         self.status_changed.emit(self.account.account_id, f"任务 {task.task_id}")
 
+        # 切到此账号 tab 后页面才会被 Chromium 视为可见，
+        # 隐藏状态下首次加载 / 新对话不会启动流式渲染管线。
+        self.window.focus_account_tab(self.account.account_id)
+        QTimer.singleShot(200, self._dispatch_task_action)
+
+    def _dispatch_task_action(self) -> None:
+        if not self.running or self.current_task is None:
+            return
         if self.window.new_chat_check.isChecked():
             self.account.run_js(js_call("newChat", self.window.automation_options()), self._after_new_chat)
         else:
@@ -140,6 +155,7 @@ class AccountRunner(QObject):
                 QTimer.singleShot(3000, self._prepare_and_send)
 
         self.account.page.loadFinished.connect(after_load)
+        self.window.focus_account_tab(self.account.account_id)
         self.account.load_chat()
         QTimer.singleShot(10000, lambda: after_load(False))
 
@@ -211,6 +227,7 @@ class AccountRunner(QObject):
         self.request_time = now_iso()
         self.poll_started_monotonic = time.monotonic()
         self.last_change_monotonic = self.poll_started_monotonic
+        self._approaching_timeout_focused = False
         self.window.mark_task(task.task_id, "等待回复", self.account.account_id)
         self.window.log(f"账号 {self.account.account_id} 已发送任务 {task.task_id}")
         QTimer.singleShot(self.window.poll_interval_spin.value() * 1000, self._poll_reply)
@@ -255,7 +272,19 @@ class AccountRunner(QObject):
             return
 
         timeout = self.window.reply_timeout_spin.value()
-        if now - self.poll_started_monotonic > timeout:
+        elapsed_wait = now - self.poll_started_monotonic
+        if (
+            not self._approaching_timeout_focused
+            and timeout > 0
+            and elapsed_wait >= timeout * 0.8
+        ):
+            self._approaching_timeout_focused = True
+            self.window.focus_account_tab(self.account.account_id)
+            self.window.log(
+                f"账号 {self.account.account_id} 等待回复 {elapsed_wait:.0f}/{timeout}s，"
+                f"接近超时已自动切到该标签页。"
+            )
+        if elapsed_wait > timeout:
             self.running = False
             self._record_failure()
             self.window.mark_task(task.task_id, "超时，账号暂停", self.account.account_id)

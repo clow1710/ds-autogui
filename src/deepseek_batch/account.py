@@ -38,6 +38,8 @@ class AccountPane(QWidget):
         settings = self.page.settings()
         settings.setAttribute(enum_value(QWebEngineSettings, "WebAttribute", "LocalStorageEnabled"), True)
         settings.setAttribute(enum_value(QWebEngineSettings, "WebAttribute", "JavascriptEnabled"), True)
+        self._active_lifecycle_state = enum_value(QWebEnginePage, "LifecycleState", "Active")
+        self.page.recommendedStateChanged.connect(self._on_recommended_state_changed)
 
         self.view = QWebEngineView(self)
         self.view.setPage(self.page)
@@ -67,6 +69,12 @@ class AccountPane(QWidget):
 
     def _load_finished(self, ok: bool) -> None:
         self._set_status("已加载" if ok else "加载失败")
+
+    def _on_recommended_state_changed(self, state: Any) -> None:
+        if self.disposed:
+            return
+        if state != self._active_lifecycle_state:
+            self.page.setLifecycleState(self._active_lifecycle_state)
 
     def load_chat(self) -> None:
         if self.disposed:
